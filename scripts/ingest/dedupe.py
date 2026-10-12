@@ -1,53 +1,90 @@
 """Collapse JSONL records that are duplicate views of the same page.
 
 ReadMe sometimes serves identical content at multiple URLs (e.g., `/docs/auth`
-and `/reference/auth` both render the same `doc.body`). Our BFS picks up both;
-left untreated they would create twin vectors in FAISS, surface the same chunk
-twice in retrieval, and waste prompt context.
+and `/reference/auth` both render the same `doc.body`). Our crawl picks up
+both; left untreated they would create twin vectors in FAISS, surface the same
+chunk twice in retrieval, and waste prompt context.
 
-Detection:  sha256(body_md). Records with the same hash are byte-identical.
+Detection: sha256(body_md), plus — for `type=endpoint` pages — the identity of
+the operation the page documents. Endpoint pages often share boilerplate prose
+(a "Scheduled for Sunset" banner, a stray `<br />`) while documenting
+*different* operations; hashing the body alone used to drop such pages and
+with them the only page-level home of their operation.
 
-Tie-break (which URL wins when a hash collision is found):
-  1. `discovered_via=sidebar` beats `discovered_via=link_bfs`. Sidebar entries
-     are the URLs ReadMe officially navigates to.
-  2. Longer `body_md` wins. Hashes match so this is academic, but if any
+Preference order (which URL wins when a collision is found, and the order the
+chunker processes records in — see `order_records`):
+  1. How the crawler discovered the page (`discovered_via`): official
+     navigation first (sidebar, reference sidebar, changelog index, sitemap),
+     then derived sources (changelog refs, OAS operations), then pages found
+     only by following links. Records without the field (legacy datasets)
+     rank last, which keeps them deterministic among themselves.
+  2. Non-hidden before hidden.
+  3. Longer `body_md` wins. Hashes match so this is academic, but if any
      rendering difference creeps in, keep the richer record.
-  3. Lexicographic URL — deterministic so re-runs are reproducible.
+  4. Lexicographic URL — deterministic so re-runs are reproducible.
 
-The decision logic mirrors the ranking we sort the input list by; the first
-record per hash wins.
+The first record per identity in that order wins.
 """
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
+
+from scripts.ingest.oas_synth import page_operation
+
+#: Rank of each `discovered_via` value; lower wins. Unknown/missing rank last.
+#: Same order as the crawler's `scripts.crawler.sidebar.DISCOVERY_SOURCES`
+#: (kept as a literal so the ingest does not import the HTTP crawler; a test
+#: pins the two together).
+DISCOVERY_RANK: Dict[str, int] = {
+    via: i for i, via in enumerate((
+        "sidebar",
+        "reference_sidebar",
+        "changelog_index",
+        "sitemap",
+        "changelog_ref",
+        "oas_operation",
+        "link_bfs",
+    ))
+}
+_UNKNOWN_RANK = len(DISCOVERY_RANK)
 
 
-def _content_hash(record: Dict) -> str:
-    body = (record.get("body_md") or "").encode("utf-8")
-    return hashlib.sha256(body).hexdigest()
-
-
-def _sort_key(record: Dict) -> Tuple[bool, int, str]:
-    via = record.get("discovered_via") or ""
-    is_not_sidebar = via != "sidebar"             # False (sidebar) sorts first
+def preference_key(record: Mapping[str, Any]) -> Tuple[int, bool, int, str]:
+    """Sort key implementing the preference order above (smaller = preferred)."""
+    via = record.get("discovered_via")
+    rank = DISCOVERY_RANK.get(via, _UNKNOWN_RANK) if isinstance(via, str) else _UNKNOWN_RANK
+    hidden = bool(record.get("hidden"))
     body_len_neg = -len(record.get("body_md") or "")
-    return (is_not_sidebar, body_len_neg, record.get("url", ""))
+    return (rank, hidden, body_len_neg, str(record.get("url") or ""))
+
+
+def order_records(records: Sequence[Dict]) -> List[Dict]:
+    """Records in preference order (stable; does not mutate the input)."""
+    return sorted(records, key=preference_key)
+
+
+def _content_hash(record: Mapping[str, Any]) -> str:
+    h = hashlib.sha256((record.get("body_md") or "").encode("utf-8"))
+    if record.get("type") == "endpoint":
+        op = page_operation(record)
+        if op is not None:
+            h.update(f"\x00{op[0].upper()} {op[1]}".encode("utf-8"))
+    return h.hexdigest()
 
 
 def dedupe_by_content(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
-    """Return (kept, dropped). `dropped` is for logging — same shape as `kept`.
+    """Return (kept, dropped), both in preference order. `dropped` is for logging.
 
     Records with empty bodies are NOT collapsed against each other on the
     body_md hash alone (every empty-body record would otherwise dedupe to one).
     Empty-body records are passed through as-is; their content uniqueness
     comes from the OAS spec, which the chunker handles separately.
     """
-    sorted_recs = sorted(records, key=_sort_key)
-    seen: dict[str, Dict] = {}
+    seen: Dict[str, Dict] = {}
     kept: List[Dict] = []
     dropped: List[Dict] = []
-    for r in sorted_recs:
+    for r in order_records(records):
         body = r.get("body_md") or ""
         if not body.strip():
             kept.append(r)

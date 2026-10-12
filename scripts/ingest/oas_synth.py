@@ -1,33 +1,57 @@
-"""Render an endpoint record's OAS spec (and optional `doc_api`) into markdown.
+"""Render OpenAPI operations (and optional ReadMe `doc.api` samples) into markdown.
 
-Endpoint pages on Developer Connect carry their docs as structured OpenAPI in the
-`oas` field of each JSONL record, with `body_md` empty for ~95% of endpoints.
-The retrieval pipeline can't embed structured JSON, so we render it to LLM-friendly
-markdown here.
+Reference pages on Developer Connect carry their docs as structured OpenAPI,
+with `body_md` empty for most endpoints. The retrieval pipeline can't embed
+structured JSON, so we render it to LLM-friendly markdown here.
 
-Public entry point:
-    synthesize_endpoint_markdown(record) -> str
+ReadMe attaches the *whole* OpenAPI file of an API group to every reference
+page, so rendering "the page's OAS" naively means rendering every operation of
+the group on every page (the old behaviour: ~58K chars per page, 89% duplicate
+chunks). Everything here therefore works on ONE operation, or on a compact
+overview of the document:
+
+Public entry points:
+    synthesize_operation_markdown(oas, method, path, *, doc_api=None) -> str
+        Full reference for a single operation (servers, merged parameters,
+        request body, responses, code samples). Typically 1-10K chars; large
+        request/response schemas are capped (see the tunables below).
+    synthesize_api_overview(oas) -> str
+        Info + base URLs + one line per operation. No schemas or examples.
+    synthesize_endpoint_markdown(record, oas=None) -> str
+        Backward-compatible record-level helper: the page's own operation when
+        it can be identified, otherwise the overview.
+    synthesize_code_samples(doc_api) -> str
+        Only the page's `doc.api` code samples.
+    page_operation(record, oas=None) -> (method, path) | None
+        Which operation a record documents: the crawler's `operation` field
+        (new data contract) or `find_page_operation` on the OAS (legacy).
 
 The renderer:
-  - dereferences `$ref`s against `components.parameters` / `components.schemas`
-    (depth-capped, cycle-guarded);
+  - dereferences `$ref`s against the document (depth-capped, cycle-guarded);
   - inlines schema JSON when small, falls back to a field table when large;
   - truncates oversized example payloads;
   - appends rendered code samples from `doc.api` when ReadMe has them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-# Tunables. Defaults chosen so a typical endpoint synthesizes to ~2-8K chars,
-# which sits cleanly under the 2K-page-wise / 1500-char-split chunking thresholds.
+from scripts.crawler.oas import find_page_operation, iter_operations
+
+# Tunables. They bound the size of a single operation's markdown: each schema
+# is either inlined (<= MAX_INLINE_SCHEMA_CHARS) or summarized as a capped
+# field table, and only one example per content block is kept.
 MAX_DEREF_DEPTH = 4
 MAX_INLINE_SCHEMA_CHARS = 4000      # inline as JSON if rendered size <= this
 MAX_SCHEMA_TABLE_CHARS = 3500       # hard cap on field-table output per schema
 MAX_EXAMPLE_CHARS = 4000
 MAX_EXAMPLES_PER_BLOCK = 1  # avoid Model+Live duplication on this site
-MAX_FIELD_TABLE_DEPTH = 1           # don't recurse into nested objects; field list only
+# Corpus-level sharing (see `_render_once`): schema/example blocks at least
+# this large are rendered in full once and referenced afterwards.
+MIN_SHARED_BLOCK_CHARS = 400
+MAX_SHARED_FIELD_NAMES = 40
 
 
 # --- $ref resolution ----------------------------------------------------------
@@ -121,7 +145,7 @@ def _render_examples(examples: Optional[Dict], heading_level: int) -> List[str]:
 
 # --- Schema rendering ---------------------------------------------------------
 
-def _render_schema(schema: Optional[Dict], oas: Dict) -> List[str]:
+def _render_schema(schema: Optional[Dict]) -> List[str]:
     """Render a (already dereferenced) schema as either inline JSON or a field table."""
     if not schema:
         return []
@@ -136,13 +160,15 @@ def _iter_properties(schema: Dict) -> Iterable[Tuple[str, Dict, bool]]:
     if not isinstance(schema, dict):
         return
     props = schema.get("properties") or {}
-    required = set(schema.get("required") or [])
+    if not isinstance(props, dict):
+        return
+    required = set(r for r in (schema.get("required") or []) if isinstance(r, str))
     for name, prop in props.items():
         if isinstance(prop, dict):
             yield name, prop, name in required
 
 
-def _type_label(schema: Dict) -> str:
+def _type_label(schema: Any) -> str:
     if not isinstance(schema, dict):
         return ""
     t = schema.get("type")
@@ -151,7 +177,9 @@ def _type_label(schema: Dict) -> str:
         inner = _type_label(items) or "object"
         return f"array<{inner}>"
     if isinstance(t, list):
-        return "|".join(t)
+        # OAS 3.1 allows `type: ["string", "null"]`; YAML/JSON quirks can also
+        # leave non-string members (a bare null), so stringify defensively.
+        return "|".join("null" if x is None else str(x) for x in t)
     fmt = schema.get("format")
     if t and fmt:
         return f"{t} ({fmt})"
@@ -164,16 +192,17 @@ def _type_label(schema: Dict) -> str:
     return ""
 
 
-def _flatten_description(desc: Optional[str]) -> str:
+def _flatten_description(desc: Any) -> str:
     """Markdown table cells can't contain raw newlines or pipes. Squash both."""
     if not desc:
         return ""
-    return desc.replace("|", "\\|").replace("\n", " ").strip()
+    return str(desc).replace("|", "\\|").replace("\n", " ").strip()
 
 
-def _render_schema_table(schema: Dict, depth: int = 0) -> List[str]:
+def _render_schema_table(schema: Dict) -> List[str]:
     """Field-table representation for schemas too large to inline.
 
+    Lists top-level fields only (nested objects show as their type label).
     Hard-caps total output at `MAX_SCHEMA_TABLE_CHARS` to keep large schemas
     (e.g., `applicationnew` with hundreds of nested objects) from overwhelming
     the synthesized markdown. Past the cap, truncates with a note.
@@ -183,13 +212,13 @@ def _render_schema_table(schema: Dict, depth: int = 0) -> List[str]:
 
     if obj_type == "array" and isinstance(schema.get("items"), dict):
         out.append("_Array of:_")
-        out.extend(_render_schema_table(schema["items"], depth=depth))
+        out.extend(_render_schema_table(schema["items"]))
         return out
 
     rows = list(_iter_properties(schema))
     if not rows:
         label = _type_label(schema) or "schema"
-        if schema.get("description"):
+        if isinstance(schema, dict) and schema.get("description"):
             return [f"_{label}_ — {_flatten_description(schema['description'])}"]
         return [f"_{label}_"]
 
@@ -217,70 +246,178 @@ def _render_schema_table(schema: Dict, depth: int = 0) -> List[str]:
 
 # --- Parameters ---------------------------------------------------------------
 
-def _render_parameters(parameters: List[Dict], oas: Dict) -> List[str]:
+def _merge_parameters(path_level: Any, op_level: Any, oas: Dict) -> List[Dict]:
+    """Path-item parameters merged with operation parameters (dereferenced).
+
+    Per OpenAPI, an operation-level parameter overrides a path-level one with
+    the same (name, in). Path-level parameters come first (they are usually
+    the `{id}` segments of the path), then the operation's own.
+    """
+    def _derefed(params: Any) -> List[Dict]:
+        if not isinstance(params, list):
+            return []
+        out = []
+        for p in params:
+            d = _deref(p, oas) if isinstance(p, dict) else None
+            if isinstance(d, dict):
+                out.append(d)
+        return out
+
+    op_params = _derefed(op_level)
+    overridden = {(p.get("name"), p.get("in")) for p in op_params}
+    merged = [p for p in _derefed(path_level) if (p.get("name"), p.get("in")) not in overridden]
+    return merged + op_params
+
+
+def _render_parameters(parameters: List[Dict]) -> List[str]:
+    """Table of already-dereferenced parameter objects."""
     if not parameters:
         return []
     out = ["### Parameters", "", "| Name | In | Required | Type | Description |",
            "| --- | --- | --- | --- | --- |"]
     for p in parameters:
-        if not isinstance(p, dict):
-            continue
-        deref = _deref(p, oas)
-        if not isinstance(deref, dict):
-            continue
-        name = deref.get("name") or ""
-        loc = deref.get("in") or ""
-        required = deref.get("required", False)
-        schema = deref.get("schema") or {}
-        type_str = _type_label(schema) if isinstance(schema, dict) else ""
-        desc = _flatten_description(deref.get("description"))
+        name = p.get("name") or ""
+        loc = p.get("in") or ""
+        required = p.get("required", False)
+        schema = p.get("schema") or {}
+        type_str = _type_label(schema)
+        desc = _flatten_description(p.get("description"))
         out.append(f"| `{name}` | {loc} | {'yes' if required else 'no'} | {type_str} | {desc} |")
     return out
 
 
+# --- Servers ------------------------------------------------------------------
+
+def _server_list(servers: Any) -> List[str]:
+    """`servers` entries as display strings; blank URLs (a ReadMe artifact) dropped."""
+    if not isinstance(servers, list):
+        return []
+    out: List[str] = []
+    for s in servers:
+        if not isinstance(s, dict):
+            continue
+        url = str(s.get("url") or "").strip()
+        if not url:
+            continue
+        text = f"`{url}`"
+        desc = str(s.get("description") or "").strip()
+        if desc:
+            text += f" ({desc})"
+        variables = s.get("variables")
+        if isinstance(variables, dict) and variables:
+            defaults = ", ".join(
+                f"{k}={v.get('default')}" for k, v in variables.items()
+                if isinstance(v, dict) and v.get("default") is not None
+            )
+            if defaults:
+                text += f" [variables: {defaults}]"
+        if text not in out:
+            out.append(text)
+    return out
+
+
+def _render_servers(*candidates: Any) -> List[str]:
+    """First non-empty `servers` list wins (operation > path item > document)."""
+    for servers in candidates:
+        shown = _server_list(servers)
+        if shown:
+            label = "Base URL" if len(shown) == 1 else "Base URLs"
+            return [f"{label}: " + ", ".join(shown)]
+    return []
+
+
 # --- Request / response bodies ------------------------------------------------
 
+def _schema_field_names(schema: Any, limit: int = MAX_SHARED_FIELD_NAMES) -> str:
+    """Compact "Fields: `a`, `b` (+N more)" line for a schema shown elsewhere."""
+    if isinstance(schema, dict) and schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        schema = schema["items"]
+    names = [name for name, _, _ in _iter_properties(schema)]
+    if not names:
+        return ""
+    shown = ", ".join(f"`{n}`" for n in names[:limit])
+    more = f" (+{len(names) - limit} more)" if len(names) > limit else ""
+    return f"Fields: {shown}{more}."
+
+
+def _render_once(lines: List[str], seen: Optional[Dict[str, str]], label: str,
+                 summary: str = "") -> List[str]:
+    """Render a large schema/example block in full only the first time it occurs.
+
+    Operations often share a body schema (the POST request of a resource is
+    the GET response of the same resource). With a `seen` ledger
+    ({sha256 of block: label of where it was rendered}) later occurrences
+    become a one-line pointer plus `summary`, instead of byte-identical chunks
+    that crowd out other results at retrieval time.
+    """
+    if seen is None or not lines:
+        return lines
+    text = "\n".join(lines)
+    if len(text) < MIN_SHARED_BLOCK_CHARS:
+        return lines
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    first = seen.get(key)
+    if first is None:
+        seen[key] = label
+        return lines
+    pointer = f"_Same as the {first} (rendered there in full)._"
+    return [pointer, summary] if summary else [pointer]
+
+
 def _render_content_block(
-    label: str,
     content: Dict,
     oas: Dict,
     *,
     schema_heading_level: int = 4,
     example_heading_level: int = 5,
+    seen: Optional[Dict[str, str]] = None,
+    where: str = "",
 ) -> List[str]:
-    """Render the `content` map of a requestBody or response (keyed by content-type)."""
+    """Render the `content` map of a requestBody or response (keyed by content-type).
+
+    `where` names the block for `_render_once` pointers, e.g.
+    "200 response of `GET /path`".
+    """
     if not isinstance(content, dict) or not content:
         return []
     out: List[str] = []
+    sh = "#" * schema_heading_level
     for ct, body in content.items():
         if not isinstance(body, dict):
             continue
         out.append(f"Content-Type: `{ct}`")
         out.append("")
         schema = _deref(body.get("schema") or {}, oas)
-        rendered = _render_schema(schema, oas)
+        rendered = _render_schema(schema)
         if rendered:
-            sh = "#" * schema_heading_level
             out.append(f"{sh} Schema")
-            out.extend(rendered)
+            out.extend(_render_once(rendered, seen, f"schema of the {where}",
+                                    _schema_field_names(schema)))
             out.append("")
         examples = body.get("examples") or {}
         if examples:
-            sh = "#" * schema_heading_level
             out.append(f"{sh} Examples")
-            out.extend(_render_examples(examples, example_heading_level))
+            out.extend(_render_once(_render_examples(_deref(examples, oas), example_heading_level),
+                                    seen, f"example of the {where}"))
             out.append("")
         elif "example" in body:
-            sh = "#" * schema_heading_level
             out.append(f"{sh} Example")
-            out.append("```json")
-            out.append(_truncate_example(body["example"]))
-            out.append("```")
+            out.extend(_render_once(["```json", _truncate_example(body["example"]), "```"],
+                                    seen, f"example of the {where}"))
             out.append("")
     return out
 
 
 # --- doc.api code samples -----------------------------------------------------
+
+def _is_meaningful_code(code: str) -> bool:
+    """Skip ReadMe stub responses like `{}`, `[]`, `null` — empty placeholders
+    that the API explorer leaves behind on pages without real interactions."""
+    s = (code or "").strip()
+    if len(s) < 5:
+        return False
+    return s not in ("{}", "[]", "null", '""', "''")
+
 
 def _render_doc_api_codes(doc_api: Optional[Dict]) -> List[str]:
     """Pull rendered cURL / Python / JS examples out of `doc.api` when present.
@@ -292,21 +429,13 @@ def _render_doc_api_codes(doc_api: Optional[Dict]) -> List[str]:
         return []
     code_blocks: List[Tuple[str, str, str]] = []  # (heading, lang, code)
 
-    def _is_meaningful(code: str) -> bool:
-        """Skip ReadMe stub responses like `{}`, `[]`, `null` — empty placeholders
-        that the API explorer leaves behind on pages without real interactions."""
-        s = (code or "").strip()
-        if len(s) < 5:
-            return False
-        return s not in ("{}", "[]", "null", '""', "''")
-
     examples = (doc_api.get("examples") or {}).get("codes") or []
     for c in examples:
         if not isinstance(c, dict):
             continue
         lang = (c.get("language") or "").lower() or "text"
         code = c.get("code") or ""
-        if not _is_meaningful(code):
+        if not _is_meaningful_code(code):
             continue
         name = c.get("name") or lang
         code_blocks.append((f"{name}", lang, code))
@@ -317,7 +446,7 @@ def _render_doc_api_codes(doc_api: Optional[Dict]) -> List[str]:
             continue
         lang = (c.get("language") or "").lower() or "text"
         code = c.get("code") or ""
-        if not _is_meaningful(code):
+        if not _is_meaningful_code(code):
             continue
         status = c.get("status")
         name_bits = []
@@ -334,7 +463,7 @@ def _render_doc_api_codes(doc_api: Optional[Dict]) -> List[str]:
         out.append(f"#### {heading}")
         out.append(f"```{lang}")
         out.append(code if len(code) <= MAX_EXAMPLE_CHARS
-                   else code[:MAX_EXAMPLE_CHARS] + f"\n... (truncated)")
+                   else code[:MAX_EXAMPLE_CHARS] + "\n... (truncated)")
         out.append("```")
         out.append("")
     return out
@@ -342,10 +471,23 @@ def _render_doc_api_codes(doc_api: Optional[Dict]) -> List[str]:
 
 # --- Operation rendering ------------------------------------------------------
 
-_HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
+def _lookup_operation(oas: Optional[Dict], method: str, path: str) -> Optional[Tuple[Dict, Dict]]:
+    """Return (path_item, operation) for `method path`, or None if absent."""
+    if not isinstance(oas, dict):
+        return None
+    item = (oas.get("paths") or {}).get(path)
+    if not isinstance(item, dict):
+        return None
+    m = method.lower()
+    for key, op in item.items():
+        if isinstance(key, str) and key.lower() == m and isinstance(op, dict):
+            return item, op
+    return None
 
 
-def _render_operation(method: str, path: str, op: Dict, oas: Dict) -> List[str]:
+def _render_operation(method: str, path: str, item: Dict, op: Dict, oas: Dict,
+                      seen: Optional[Dict[str, str]] = None) -> List[str]:
+    where = f"`{method.upper()} {path}`"
     out = [f"## {method.upper()} {path}", ""]
     summary = op.get("summary")
     description = op.get("description")
@@ -359,9 +501,14 @@ def _render_operation(method: str, path: str, op: Dict, oas: Dict) -> List[str]:
         out.append("> ⚠ This operation is marked deprecated.")
         out.append("")
 
-    parameters = op.get("parameters") or []
+    servers = _render_servers(op.get("servers"), item.get("servers"), oas.get("servers"))
+    if servers:
+        out.extend(servers)
+        out.append("")
+
+    parameters = _merge_parameters(item.get("parameters"), op.get("parameters"), oas)
     if parameters:
-        out.extend(_render_parameters(parameters, oas))
+        out.extend(_render_parameters(parameters))
         out.append("")
 
     request_body = op.get("requestBody")
@@ -376,10 +523,11 @@ def _render_operation(method: str, path: str, op: Dict, oas: Dict) -> List[str]:
             if rb.get("description"):
                 out.append(str(rb["description"]).strip())
                 out.append("")
-            out.extend(_render_content_block("request body", rb["content"], oas))
+            out.extend(_render_content_block(rb["content"], oas, seen=seen,
+                                             where=f"request body of {where}"))
 
     responses = op.get("responses") or {}
-    if responses:
+    if isinstance(responses, dict) and responses:
         out.append("### Responses")
         out.append("")
         for code, resp in responses.items():
@@ -388,50 +536,165 @@ def _render_operation(method: str, path: str, op: Dict, oas: Dict) -> List[str]:
             resp_d = _deref(resp, oas)
             if not isinstance(resp_d, dict):
                 continue
-            desc = (resp_d.get("description") or "").strip()
+            desc = str(resp_d.get("description") or "").strip()
+            # 4xx/5xx responses on this site reuse a generic Error schema across
+            # every operation — rendering it dozens of times bloats synthesis
+            # without retrieval value. Render schemas/examples for 2xx only and
+            # a single line for every other status.
+            is_success = str(code).startswith("2")
+            if not is_success:
+                line = f"- `{code}`"
+                if desc:
+                    line += f" — {_flatten_description(desc)}"
+                out.append(line)
+                continue
+            if out[-1].startswith("- `"):
+                out.append("")
             head = f"#### {code}"
             if desc:
                 head = f"{head} — {desc}"
             out.append(head)
             out.append("")
-            # 4xx/5xx responses on this site reuse a generic Error schema across
-            # every operation — rendering it dozens of times bloats synthesis
-            # without retrieval value. Render schemas/examples for 2xx only.
-            is_success = isinstance(code, str) and code.startswith("2")
-            if is_success and resp_d.get("content"):
+            if resp_d.get("content"):
                 out.extend(_render_content_block(
-                    "response", resp_d["content"], oas,
+                    resp_d["content"], oas,
                     schema_heading_level=5, example_heading_level=6,
+                    seen=seen, where=f"{code} response of {where}",
                 ))
+        if out[-1].startswith("- `"):
+            out.append("")
 
     return out
 
 
+def _finish(parts: List[str]) -> str:
+    return "\n".join(parts).rstrip() + "\n" if parts else ""
+
+
 # --- Public API ---------------------------------------------------------------
 
-def synthesize_endpoint_markdown(record: Dict) -> str:
-    """Render the OAS+doc.api content of a single JSONL record into markdown.
+def synthesize_operation_markdown(
+    oas: Optional[Dict],
+    method: str,
+    path: str,
+    *,
+    doc_api: Optional[Dict] = None,
+    seen_blocks: Optional[Dict[str, str]] = None,
+) -> str:
+    """Render ONE operation of `oas` (plus the page's `doc.api` code samples).
 
-    Returns an empty string when the record has nothing renderable (no OAS paths
-    AND no usable doc.api code samples).
+    `seen_blocks` is an optional corpus-wide ledger: large schema/example
+    blocks already rendered by another operation are replaced by a pointer
+    to it (and the ledger is updated with the blocks rendered here).
+    Returns an empty string when `method path` is not in the document.
     """
-    oas = record.get("oas") or {}
-    paths = oas.get("paths") or {}
+    found = _lookup_operation(oas, method, path)
+    if found is None:
+        return ""
+    item, op = found
+    parts = _render_operation(method, path, item, op, oas, seen_blocks)  # type: ignore[arg-type]
+    codes = _render_doc_api_codes(doc_api)
+    if codes:
+        parts.append("")
+        parts.extend(codes)
+    return _finish(parts)
+
+
+def synthesize_api_overview(oas: Optional[Dict]) -> str:
+    """Compact overview of an OAS document: what the API group is and what it offers.
+
+    Used for reference overview pages, which carry the group's document but
+    no operation of their own. One line per operation; no schemas or examples
+    (each operation is rendered in full exactly once elsewhere).
+    """
+    if not isinstance(oas, dict):
+        return ""
+    ops = list(iter_operations(oas))
+    info = oas.get("info") if isinstance(oas.get("info"), dict) else {}
+    title = str(info.get("title") or "").strip()
+    version = str(info.get("version") or "").strip()
+    description = str(info.get("description") or "").strip()
+    if not ops and not title and not description:
+        return ""
+
+    heading = title or "API"
+    if version:
+        heading += f" (version {version})"
+    parts = [f"## {heading} — API overview", ""]
+    if description:
+        parts += [description, ""]
+    servers = _render_servers(oas.get("servers"))
+    if servers:
+        parts += servers + [""]
+    if ops:
+        parts += [f"### Operations ({len(ops)})", ""]
+        for method, path, op in ops:
+            line = f"- {method.upper()} {path}"
+            summary = str(op.get("summary") or "").strip()
+            if summary:
+                line += f" - {summary}"
+            if op.get("operationId"):
+                line += f" ({op['operationId']})"
+            if op.get("deprecated"):
+                line += " [deprecated]"
+            parts.append(line)
+    return _finish(parts)
+
+
+def synthesize_code_samples(doc_api: Optional[Dict]) -> str:
+    """Just the `doc.api` code samples of a page (cURL/JSON request + responses)."""
+    return _finish(_render_doc_api_codes(doc_api))
+
+
+def page_operation(record: Mapping[str, Any], oas: Optional[Dict] = None) -> Optional[Tuple[str, str]]:
+    """`(method, path)` of the operation a record documents, or None.
+
+    New-contract records carry the crawler's answer in `operation`; it is
+    trusted when `oas` is unknown (e.g. during dedupe, before the registry is
+    consulted) or when it names an operation present in `oas`. Otherwise fall
+    back to `find_page_operation` — the same matcher the crawler uses — so
+    legacy records (embedded `oas`, no `operation`) resolve identically.
+    """
+    if oas is None:
+        oas = record.get("oas")
+    op = record.get("operation")
+    if isinstance(op, dict):
+        method = str(op.get("method") or "").lower()
+        path = op.get("path")
+        if method and isinstance(path, str) and path:
+            if not isinstance(oas, dict) or _lookup_operation(oas, method, path) is not None:
+                return method, path
+    if not isinstance(oas, dict):
+        return None
+    return find_page_operation(
+        oas,
+        slug=str(record.get("slug") or ""),
+        title=str(record.get("title") or ""),
+        doc_api=record.get("doc_api"),
+    )
+
+
+def synthesize_endpoint_markdown(record: Mapping[str, Any], oas: Optional[Dict] = None) -> str:
+    """Render a reference record's own operation (or the API overview) as markdown.
+
+    `oas` defaults to the record's embedded `oas` (legacy records); pass the
+    registry document for new-contract records (`oas_id`). Never renders every
+    operation in full: if the page's operation cannot be identified, the
+    compact overview is returned instead. Code samples from `doc.api` are
+    appended in both cases. Returns "" when nothing is renderable.
+    """
+    if oas is None:
+        oas = record.get("oas")
+    doc_api = record.get("doc_api")
+    hit = page_operation(record, oas)
+    if hit is not None:
+        md = synthesize_operation_markdown(oas, hit[0], hit[1], doc_api=doc_api)
+        if md:
+            return md
     parts: List[str] = []
-
-    for path, ops in paths.items():
-        if not isinstance(ops, dict):
-            continue
-        for method, op in ops.items():
-            if method.lower() not in _HTTP_METHODS:
-                continue
-            if not isinstance(op, dict):
-                continue
-            parts.extend(_render_operation(method, path, op, oas))
-            parts.append("")
-
-    code_samples_md = _render_doc_api_codes(record.get("doc_api"))
-    if code_samples_md:
-        parts.extend(code_samples_md)
-
-    return "\n".join(parts).rstrip() + ("\n" if parts else "")
+    overview = synthesize_api_overview(oas)
+    if overview:
+        parts.append(overview.rstrip())
+        parts.append("")
+    parts.extend(_render_doc_api_codes(doc_api))
+    return _finish(parts)
