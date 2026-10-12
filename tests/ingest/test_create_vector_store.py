@@ -157,3 +157,20 @@ def test_dry_run_cli_needs_no_embedder(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cvs.JinaEmbedder, "from_env", classmethod(_boom))
     assert cvs.main(["--jsonl", str(path), "--dry-run"]) == 0
+
+
+def test_registry_build_keeps_operations_of_a_body_duplicate(tmp_path):
+    shared = "Shared boilerplate for every settings group."
+    legacy = [
+        record("widgets", type="basic", oas=make_oas(), body=shared, discovered_via="sidebar"),
+        record("gadgets", type="basic", oas=make_oas("Gadgets API", prefix="/gadgets"),
+               body=shared, discovered_via="link_bfs"),
+    ]
+    new, registry = to_new_contract(legacy)
+    path = _write_jsonl(tmp_path / "dc.jsonl", new)
+    (tmp_path / "dc_oas.json").write_text(json.dumps(registry), encoding="utf-8")
+    docs, stats = cvs.build_documents(path)
+    assert stats["records_dropped_dupe"] == 0
+    assert stats["operations_total"] == stats["operations_rendered"] == 10
+    ops = {d.metadata.get("operation") for d in docs}
+    assert "GET /gadgets" in ops and "GET /widgets" in ops

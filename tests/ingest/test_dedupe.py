@@ -93,3 +93,19 @@ def test_basic_pages_still_dedupe_on_body_alone():
     b = record("b", type="basic", body="Overview text", oas=make_oas("Other API"))
     kept, dropped = dedupe_by_content([a, b])
     assert len(kept) == 1 and len(dropped) == 1
+
+
+def test_body_duplicate_carrying_other_operations_is_kept():
+    """Overview pages of two API groups share boilerplate. Dropping one used to
+    drop every operation only its group's OAS document has."""
+    widgets = record("widgets", type="basic", body="Shared boilerplate.", oas=make_oas(),
+                     discovered_via="sidebar")
+    gadgets = record("gadgets", type="basic", body="Shared boilerplate.",
+                     oas=make_oas("Gadgets API", prefix="/gadgets"), discovered_via="link_bfs")
+    no_api = record("plain", type="basic", body="Shared boilerplate.", discovered_via="link_bfs")
+    legacy = [gadgets, no_api, widgets]
+    new, registry = to_new_contract(legacy)
+    for recs, reg in ((legacy, None), (new, registry), (new, None)):
+        kept, dropped = dedupe_by_content(recs, reg)
+        assert [r["slug"] for r in kept] == ["widgets", "gadgets"]
+        assert [r["slug"] for r in dropped] == ["plain"]

@@ -288,3 +288,33 @@ def test_extract_record_wrapper_still_works():
                        entry("a"), base_url=BASE, section=SEC)
     assert r["slug"] == "a" and r["body_md"] == "x"
     assert extract_record("<html></html>", entry("a"), base_url=BASE, section=SEC) is None
+
+
+# --- regressions ----------------------------------------------------------------
+
+
+def test_nested_reusable_content_is_looked_up_and_unresolved_names_reported():
+    props = {
+        "doc": {"slug": "w", "title": "W", "body": "Intro\n\n<Outer />\n\nEnd"},
+        "reusableContent": {
+            "Outer": {"body": "Alpha <Inner /> omega <Gone />"},
+            "Inner": {"body": "INNER TEXT <Deeper />"},
+            "Deeper": {"body": "DEEPER TEXT <Deepest />"},
+            "Deepest": {"body": "never expanded: too deep"},
+        },
+    }
+    ext = run(props, entry("w"))
+    body = ext.record["body_md"]
+    assert "INNER TEXT" in body and "DEEPER TEXT" in body
+    assert "too deep" not in body
+    # missing, and deeper than rewrite_body expands: both visible as gaps
+    assert ext.record["reusable_content_unresolved"] == ["Gone", "Deepest"]
+
+
+def test_changelog_found_by_reference_gets_its_real_title_in_the_breadcrumb():
+    e = entry("rel-2", "changelog", via="changelog_ref",
+              breadcrumb=["Release Notes", "rel-2"])
+    r = run({"changelog": REL2}, e).record
+    assert r["breadcrumb"] == ["Release Notes", "Release 2"]
+    nav = entry("rel-2", "changelog", via="sidebar", breadcrumb=["What's New", "Release 2 (25.1)"])
+    assert run({"changelog": REL2}, nav).record["breadcrumb"] == ["What's New", "Release 2 (25.1)"]

@@ -11,6 +11,13 @@ the operation the page documents. Endpoint pages often share boilerplate prose
 *different* operations; hashing the body alone used to drop such pages and
 with them the only page-level home of their operation.
 
+A duplicate is only dropped when that loses no API reference: if its OAS
+document (embedded `oas`, or `oas_id` in the registry) has an operation that
+no kept record's document has, it is kept. Pages of different API groups can
+share a body (an overview boilerplate, an inlined reusable snippet, a lone
+`<br />`), and the chunker only renders operations of kept records, so
+dropping such a page used to drop its group's operations silently.
+
 Preference order (which URL wins when a collision is found, and the order the
 chunker processes records in — see `order_records`):
   1. How the crawler discovered the page (`discovered_via`): official
@@ -28,8 +35,9 @@ The first record per identity in that order wins.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from scripts.crawler.oas import iter_operations
 from scripts.ingest.oas_synth import page_operation
 
 #: Rank of each `discovered_via` value; lower wins. Unknown/missing rank last.
@@ -73,13 +81,18 @@ def _content_hash(record: Mapping[str, Any]) -> str:
     return h.hexdigest()
 
 
-def dedupe_by_content(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+def dedupe_by_content(
+    records: List[Dict], oas_registry: Optional[Mapping[str, Dict]] = None,
+) -> Tuple[List[Dict], List[Dict]]:
     """Return (kept, dropped), both in preference order. `dropped` is for logging.
 
     Records with empty bodies are NOT collapsed against each other on the
     body_md hash alone (every empty-body record would otherwise dedupe to one).
     Empty-body records are passed through as-is; their content uniqueness
     comes from the OAS spec, which the chunker handles separately.
+
+    `oas_registry` resolves `oas_id`s (current crawler output); without it a
+    duplicate whose `oas_id` no kept record shares is kept.
     """
     seen: Dict[str, Dict] = {}
     kept: List[Dict] = []
@@ -95,4 +108,58 @@ def dedupe_by_content(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
             continue
         seen[h] = r
         kept.append(r)
+    rescued = _keep_api_carriers(kept, dropped, oas_registry)
+    if rescued:
+        ids = {id(r) for r in rescued}
+        kept = order_records(kept + rescued)
+        dropped = [r for r in dropped if id(r) not in ids]
     return kept, dropped
+
+
+def _carries_oas(record: Mapping[str, Any]) -> bool:
+    oas = record.get("oas")
+    return bool(record.get("oas_id")) or (isinstance(oas, dict) and bool(oas))
+
+
+def _operation_keys(
+    record: Mapping[str, Any], oas_registry: Optional[Mapping[str, Dict]],
+) -> Optional[Set[Tuple[str, str]]]:
+    """(METHOD, path) of every operation in the record's OAS document, or None
+    when the document is not available."""
+    oas = record.get("oas")
+    if not (isinstance(oas, dict) and oas):
+        oas = (oas_registry or {}).get(record.get("oas_id") or "")
+    if not isinstance(oas, dict):
+        return None
+    return {(method.upper(), path) for method, path, _ in iter_operations(oas)}
+
+
+def _keep_api_carriers(
+    kept: Sequence[Mapping[str, Any]], dropped: Sequence[Dict],
+    oas_registry: Optional[Mapping[str, Dict]],
+) -> List[Dict]:
+    """Dropped records (in preference order) whose OAS document has an
+    operation that no kept record's document has."""
+    carriers = [r for r in dropped if _carries_oas(r)]
+    if not carriers:
+        return []
+    ops: Set[Tuple[str, str]] = set()
+    oas_ids: Set[str] = set()
+
+    def cover(r: Mapping[str, Any], keys: Optional[Set[Tuple[str, str]]]) -> None:
+        ops.update(keys or ())
+        if r.get("oas_id"):
+            oas_ids.add(str(r["oas_id"]))
+
+    for r in kept:
+        if _carries_oas(r):
+            cover(r, _operation_keys(r, oas_registry))
+    rescued: List[Dict] = []
+    for r in carriers:
+        keys = _operation_keys(r, oas_registry)
+        # Unknown document: fall back to comparing documents by id.
+        new = (str(r.get("oas_id")) not in oas_ids) if keys is None else not keys <= ops
+        if new:
+            rescued.append(r)
+            cover(r, keys)
+    return rescued

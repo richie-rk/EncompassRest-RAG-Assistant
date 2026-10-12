@@ -89,7 +89,8 @@ def test_reference_definitions_and_href_attributes() -> None:
 
 def test_inline_code_span_rules() -> None:
     # a double-backtick span may contain a single backtick and stays verbatim
-    assert rw("``a ` (doc:x) <Foo />`` and (doc:y)") == f"``a ` (doc:x) <Foo />`` and ({ROOT}/docs/y)"
+    assert rw("``a ` [x](doc:x) <Foo />`` and [y](doc:y)") == (
+        f"``a ` [x](doc:x) <Foo />`` and [y]({ROOT}/docs/y)")
     # an unmatched backtick is literal and protects nothing
     assert rw("a ` b [x](doc:y)") == f"a ` b [x]({ROOT}/docs/y)"
     # spans never cross a blank line
@@ -491,3 +492,59 @@ def test_idempotent_on_real_world_shapes() -> None:
     once = rw(body)
     assert rw(once) == once
     assert "```json Date Source  = \"event\"\n>         \"dateSrc\": {\n>\n>\n>         }\n> ```" in once
+
+
+# --- regressions ------------------------------------------------------------
+
+
+def test_code_fenced_inside_nested_containers_is_left_alone() -> None:
+    for body in ('- > ```xml\n  > <Loan />\n  > <Field id="1"/>\n  > ```',
+                 "- - ```\n    <Loan />\n    ```"):
+        assert rw(body) == body
+
+
+def test_legacy_block_inside_quoted_list_item_is_converted() -> None:
+    payload = json.dumps({"type": "warning", "title": "Careful", "body": "Read this."}, indent=2)
+    quoted = "\n".join("  > " + line for line in payload.split("\n"))
+    out = rw(f"- > [block:callout]\n{quoted}\n  > [/block]")
+    assert out == "- > > **Warning: Careful**\n  > >\n  > > Read this."
+
+
+def test_parenthesised_prose_is_not_a_link_macro() -> None:
+    body = "Borrower details are on the 1003 form (page: 2) and in RFC 7231 (ref: 6.5.1)."
+    assert rw(body) == body
+    # real macros keep working in every link spelling
+    assert rw("[a](doc:x) [b](<ref: y>) [c]\\(ref: z) ![i](page:p) (<page:q>)") == (
+        f"[a]({ROOT}/docs/x) [b]({ROOT}/reference/y) [c]({ROOT}/reference/z) "
+        f"![i]({ROOT}/page/p) ({ROOT}/page/q)")
+
+
+def test_multi_line_reusable_content_in_table_cell_and_heading() -> None:
+    table = "| Field | Notes |\n|---|---|\n| loanId | <LoanIdNote /> |\n| other | x |"
+    out = rw(table, {"LoanIdNote": "Required.\n\nMust be a GUID | UUID."})
+    assert out == ("| Field | Notes |\n|---|---|\n"
+                   "| loanId | Required.<br><br>Must be a GUID \\| UUID. |\n| other | x |")
+    assert rw("## <Title />\n\nbody", {"Title": "Loan API\nv3"}) == "## Loan API v3\n\nbody"
+    # next to prose it is still split out into a block of its own
+    assert "Intro \n\na\n\nb\n\n end" == rw("Intro <Note /> end", {"Note": "a\n\nb"})
+
+
+def test_image_component_keeps_its_visible_caption() -> None:
+    out = rw('<Image src="/p.png" alt="screenshot" caption="Figure 3: Set the ACS URL" />')
+    assert out == f"![Figure 3: Set the ACS URL]({BASE_URL}/p.png)"
+    assert rw('<Image src="/p.png" alt="screenshot" />') == f"![screenshot]({BASE_URL}/p.png)"
+
+
+def test_escaped_backslash_before_backtick_opens_a_code_span() -> None:
+    # "\\\\" is an escaped backslash, so the backtick after it opens a span
+    body = "Install to C:\\\\`<Encompass />` and see `<Loan />`"
+    assert rw(body) == body
+    # an odd number escapes the first backtick: the rest of the run can still open
+    assert rw("a \\```<X />`` b") == "a \\```<X />`` b"
+    assert rw("\\`<X />` [x](doc:y)") == f"\\`` [x]({ROOT}/docs/y)"
+
+
+def test_lone_surrogate_in_legacy_block_json_is_replaced() -> None:
+    out = rw('[block:callout]{"type": "info", "body": "Great job \\ud83d"}[/block]')
+    assert out == "> **Info**\n>\n> Great job \ufffd"
+    out.encode("utf-8")

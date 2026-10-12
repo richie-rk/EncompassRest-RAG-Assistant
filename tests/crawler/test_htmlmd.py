@@ -208,3 +208,34 @@ def test_underscores_not_escaped_and_javascript_links_unwrapped() -> None:
 def test_collapses_blank_runs_from_br_soup() -> None:
     md = html_to_markdown("<div>top</div><br><br><br><br><br><div>bottom</div>")
     assert md == "top\n\nbottom"
+
+
+# --- regressions ------------------------------------------------------------
+
+
+def test_document_without_closing_head_keeps_its_body() -> None:
+    # HTML5 lets "</head>" be omitted; html.parser then nests <body> in <head>.
+    doc = ('<html><head><meta charset="utf-8"><title>Doc</title><style>h1{color:red}</style>'
+           '<body><h1>Getting an API key</h1><p>Sign in and open Settings.</p></body></html>')
+    assert html_to_markdown(doc) == "# Getting an API key\n\nSign in and open Settings."
+    assert html_to_markdown("<head><style>p{}</style>\n<h1>Lender MFA</h1><p>Enable MFA.</p>") == (
+        "# Lender MFA\n\nEnable MFA.")
+    # a well-formed head still contributes nothing
+    assert html_to_markdown("<html><head><title>T</title><base href='/'></head>"
+                            "<body><p>Hi</p></body></html>") == "Hi"
+
+
+@pytest.mark.parametrize("text", [
+    "- > ```xml\n  > <Loan />\n  > ```",
+    "- - ```\n    <Loan />\n    ```",
+    "1. > - ```\n   >   <Loan />\n   >   ```",
+])
+def test_fence_opening_after_nested_container_markers(text: str) -> None:
+    assert _code(text) == [text]
+
+
+def test_pre_at_the_start_of_nested_containers_round_trips_as_code() -> None:
+    for html in ("<ul><li><ul><li><pre>&lt;Loan /&gt;</pre></li></ul></li></ul>",
+                 "<ul><li><blockquote><pre>&lt;Loan /&gt;</pre></blockquote></li></ul>"):
+        md = html_to_markdown(html)
+        assert len(_code(md)) == 1 and "<Loan />" in _code(md)[0], md

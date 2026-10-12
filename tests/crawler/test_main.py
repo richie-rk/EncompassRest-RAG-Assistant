@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -512,3 +513,239 @@ def test_offline_rerun_from_cache_without_network(tmp_path):
     # 404s were never cached, so offline they surface as cache misses (not failures)
     assert report["failures"]["offline_cache_miss"]["unexpected"] == 0
     assert report["options"]["offline"] is True
+
+
+# --- regressions ------------------------------------------------------------------
+
+
+class _SiteSession:
+    """A requests-like session serving the synthetic site (for the real Fetcher)."""
+
+    headers: Dict = {}
+
+    def __init__(self, pages, resources, fail=lambda url: False):
+        self.pages, self.resources, self.fail = pages, resources, fail
+        self.calls: List[str] = []
+
+    def get(self, url, **_):
+        import requests
+
+        self.calls.append(url)
+        if self.fail(url):
+            raise requests.ConnectionError("network is down")
+        served = self.resources.get(url, self.pages.get(url, 404))
+        resp = type("Resp", (), {})()
+        resp.url, resp.headers = url, {}
+        resp.status_code, resp.text = (served, "") if isinstance(served, int) else (200, served)
+        return resp
+
+
+def _real_fetcher(tmp_path: Path, session, **kw) -> Fetcher:
+    return Fetcher(tmp_path / "cache" / SEC, delay=0, retries=1, session=session,
+                   sleep=lambda s: None, **kw)
+
+
+def test_changelog_entry_referenced_before_its_index_listing_keeps_its_record(tmp_path):
+    """rel-3's body references rel-2, which the index lists next; /changelog/rel-2
+    serves the newest entry, so only the index copy of rel-2 has its text."""
+    rel3 = {"_id": "c3", "slug": "rel-3", "title": "Release 3",
+            "body": "See [previous](changelog:rel-2)."}
+    pages = site_pages()
+    pages[f"{P}/changelog"] = _changelog_page(rel3, REL2, single=rel3)
+    pages[f"{P}/changelog?page=2"] = _changelog_page(REL1, single=rel3)
+    pages[f"{P}/changelog?page=3"] = _changelog_page(REL0, single=rel3)
+    pages[f"{P}/changelog?page=4"] = _changelog_page(single=rel3)
+    pages[f"{P}/changelog/rel-3"] = _changelog_page(single=rel3)
+    pages[f"{P}/changelog/rel-2"] = _changelog_page(single=rel3)  # serves the newest
+    assert cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, site_resources())) == 0
+    recs, _, _, report = load(tmp_path)
+    rel2 = recs[f"{P}/changelog/rel-2"]
+    assert rel2["body_md"] == "Two." and rel2["changelog_source"] == "index"
+    assert rel2["discovered_via"] == "changelog_index"
+    assert rel2["breadcrumb"] == ["Release Notes", "Release 2"]
+    assert recs[f"{P}/changelog/rel-0"]["body_md"] == "Zero."
+    assert report["changelog_index"]["entries"] == 4
+    # an entry only ever referenced gets its real title in the breadcrumb
+    assert recs[f"{P}/changelog/rel-old"]["breadcrumb"] == ["Release Notes", "Old Release"]
+
+
+def test_changelog_index_server_error_fails_the_run(tmp_path):
+    pages = site_pages()
+    pages[f"{P}/changelog?page=2"] = 503  # rel-0 is listed only there
+    code = cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, site_resources()))
+    assert code == 1
+    recs, _, _, report = load(tmp_path)
+    assert f"{P}/changelog/rel-0" not in recs
+    assert report["changelog_index"]["incomplete"] is True
+    assert [(f["url"], f["error_class"]) for f in report["unexpected_failures"]] == [
+        (f"{P}/changelog?page=2", "http_error")]
+
+
+def test_sitemap_server_error_fails_the_run_but_a_missing_sitemap_does_not(tmp_path):
+    resources = site_resources()
+    resources[f"{P}/sitemap.xml"] = 502
+    code = cli.main(argv(tmp_path), fetcher=FakeFetcher(site_pages(), resources))
+    assert code == 1
+    _, _, _, report = load(tmp_path)
+    assert report["sitemap"]["incomplete"] is True
+    assert [f["url"] for f in report["unexpected_failures"]] == [f"{P}/sitemap.xml"]
+    # the site-level sitemap.xml is a 404 in every run: tolerated
+    assert report["failures"]["http_error"]["count"] == 1
+
+
+class _RedirectingFetcher(FakeFetcher):
+    def __init__(self, pages, resources, redirects):
+        super().__init__(pages, resources)
+        self.redirects = redirects
+
+    def fetch(self, url):
+        target = self.redirects.get(url)
+        if target is None:
+            return super().fetch(url)
+        self.calls.append(url)
+        res = self._serve(target, self.pages)
+        res.url, res.final_url = url, target
+        return res
+
+
+def test_redirect_out_of_the_section_is_neither_stored_nor_harvested(tmp_path):
+    foreign = ssr_html({
+        "sidebars": {"docs": [{"title": "Partner", "slug": "p", "pages": [
+            {"slug": "partner-a", "title": "Partner A"},
+            {"slug": "partner-b", "title": "Partner B"}]}]},
+        "doc": _doc("partner-a", "Partner A", "Another project's page."),
+    })
+    pages = site_pages()
+    pages[f"{BASE}/other/docs/partner-a"] = foreign
+    fetcher = _RedirectingFetcher(pages, site_resources(),
+                                  {f"{P}/docs/html-guide": f"{BASE}/other/docs/partner-a"})
+    assert cli.main(argv(tmp_path), fetcher=fetcher) == 0
+    recs, manifest, _, report = load(tmp_path)
+    assert f"{P}/docs/html-guide" not in recs
+    assert not any("Another project" in r["body_md"] for r in recs.values())
+    assert f"{P}/docs/partner-a" not in fetcher.calls  # foreign sidebar not walked
+    row = next(m for m in manifest if m["url"] == f"{P}/docs/html-guide")
+    assert row["error_class"] == "off_section_redirect" and row["unexpected"] is False
+    assert row["final_url"] == f"{BASE}/other/docs/partner-a"
+    assert f"{BASE}/other/docs/partner-a" in {l["url"] for l in report["external_links"]}
+
+
+def test_offline_cache_miss_of_a_navigation_page_is_unexpected(tmp_path):
+    pages, resources = site_pages(), site_resources()
+    online = _real_fetcher(tmp_path, _SiteSession(pages, resources))
+    assert cli.main(argv(tmp_path), fetcher=online) == 0
+    # a sidebar page's cache file goes missing (partly filled cache)
+    online.cache_path_for(f"{P}/docs/html-guide").unlink()
+    (tmp_path / "data" / "developer_connect.jsonl").unlink()  # nothing to protect
+    offline = _real_fetcher(tmp_path, _SiteSession({}, {}), offline=True)
+    assert cli.main(argv(tmp_path, "--offline"), fetcher=offline) == 1
+    _, _, _, report = load(tmp_path)
+    assert [(f["url"], f["error_class"]) for f in report["unexpected_failures"]] == [
+        (f"{P}/docs/html-guide", "offline_cache_miss")]
+    # misses of guessed/linked URLs (404s are never cached) stay expected
+    assert report["failures"]["offline_cache_miss"]["count"] == 5
+    assert report["failures"]["offline_cache_miss"]["unexpected"] == 1
+
+
+def test_offline_run_over_partial_cache_does_not_replace_the_dataset(tmp_path):
+    pages, resources = site_pages(), site_resources()
+    assert cli.main(argv(tmp_path),
+                    fetcher=_real_fetcher(tmp_path, _SiteSession(pages, resources))) == 0
+    before = {p: p.read_bytes() for p in outputs(tmp_path).values()}
+    # The cache is wiped and refilled by a 2-page debug run.
+    import shutil
+
+    shutil.rmtree(tmp_path / "cache")
+    sample = tmp_path / "sample" / "developer_connect.sample.jsonl"
+    assert cli.main(argv(tmp_path, "--limit", "2", "--out", str(sample)),
+                    fetcher=_real_fetcher(tmp_path, _SiteSession(pages, resources))) == 0
+    offline = _real_fetcher(tmp_path, _SiteSession({}, {}), offline=True)
+    assert cli.main(argv(tmp_path, "--offline"), fetcher=offline) == 1
+    assert {p: p.read_bytes() for p in outputs(tmp_path).values()} == before
+    partial = outputs(tmp_path)["report"].with_name("developer_connect_report.json.partial")
+    report = json.loads(partial.read_text())
+    assert report["published"] is False and report["exit_code"] == 1
+    assert "13 already published" in report["not_published_reason"]
+
+
+def test_failed_run_with_far_fewer_records_keeps_the_published_dataset(tmp_path):
+    pages, resources = site_pages(), site_resources()
+    assert cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, resources)) == 0
+    before = {p: p.read_bytes() for p in outputs(tmp_path).values()}
+
+    # The network drops after the seed documents: every page fetch fails.
+    seeds = {f"{P}/docs/welcome", f"{P}/changelog", f"{P}/changelog?page=2",
+             f"{P}/changelog?page=3"}
+    session = _SiteSession(pages, resources,
+                           fail=lambda url: url not in seeds and "sitemap" not in url)
+    assert cli.main(argv(tmp_path, "--no-cache"), fetcher=_real_fetcher(
+        tmp_path, session, force_refresh=True)) == 1
+    assert {p: p.read_bytes() for p in outputs(tmp_path).values()} == before
+    assert outputs(tmp_path)["out"].with_name("developer_connect.jsonl.partial").exists()
+
+    # --force-publish replaces them anyway
+    assert cli.main(argv(tmp_path, "--no-cache", "--force-publish"), fetcher=_real_fetcher(
+        tmp_path, session, force_refresh=True)) == 1
+    recs, _, _, report = load(tmp_path)
+    assert len(recs) < 13 and report["published"] is True
+    assert not list((tmp_path / "data").glob("*.partial"))
+
+
+def test_publish_guard_thresholds():
+    reason = cli.publish_blocked_reason
+    assert reason(records=0, previous=0, exit_code=1) is None  # nothing to protect
+    assert reason(records=0, previous=900, exit_code=0)  # an empty dataset never replaces one
+    assert reason(records=500, previous=900, exit_code=1)
+    assert reason(records=500, previous=900, exit_code=0) is None  # a clean run is trusted
+    assert reason(records=890, previous=900, exit_code=1) is None  # a few failures publish
+
+
+@pytest.mark.parametrize("flag", ["--max-pages", "--limit"])
+def test_negative_caps_are_rejected(flag, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args([flag, "-1"])
+    assert exc.value.code == 2
+    assert "must be 0 or more" in capsys.readouterr().err
+    assert getattr(cli.parse_args([flag, "0"]), flag[2:].replace("-", "_")) == 0
+
+
+def test_failed_publish_restores_every_previous_output(tmp_path, monkeypatch, capsys):
+    before = _seed_existing(tmp_path)
+    records_target = outputs(tmp_path)["out"]
+    real_replace = os.replace
+
+    def locked(src, dst):  # e.g. the records file held open by another process on Windows
+        if Path(dst) == records_target and str(src).endswith(".partial"):
+            raise PermissionError("file in use")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(cli.os, "replace", locked)
+    with pytest.raises(PermissionError):
+        cli.main(argv(tmp_path), fetcher=FakeFetcher(site_pages(), site_resources()))
+    for path, text in before.items():  # the registry was replaced first, then restored
+        assert path.read_text(encoding="utf-8") == text
+    data = tmp_path / "data"
+    assert not list(data.glob("*.bak"))
+    partials = sorted(p.name for p in data.glob("*.partial"))
+    assert len(partials) == 4
+    registry = json.loads((data / "developer_connect_oas.json.partial").read_text())
+    assert len(registry) == 2  # the new outputs are kept for inspection
+    assert "Previous output files were left untouched" in capsys.readouterr().out
+
+
+def test_dry_run_with_the_real_fetcher_writes_nothing(tmp_path, monkeypatch):
+    session = _SiteSession(site_pages(), site_resources())
+    monkeypatch.setattr("requests.Session.get", lambda self, url, **kw: session.get(url))
+    assert cli.main(argv(tmp_path, "--dry-run", "--delay", "0")) == 0
+    assert f"{P}/docs/welcome" in session.calls  # the seeds were fetched ...
+    assert list(tmp_path.iterdir()) == []      # ... but nothing was written, not even the cache
+
+
+def test_lone_surrogate_in_page_json_does_not_abort_the_crawl(tmp_path):
+    pages = site_pages()
+    pages[f"{P}/docs/html-guide"] = pages[f"{P}/docs/html-guide"].replace(
+        "Step one: get a token.", "Great job \\\\ud83d")
+    assert "\\ud83d" in pages[f"{P}/docs/html-guide"]
+    assert cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, site_resources())) == 0
+    recs, *_ = load(tmp_path)
+    assert "Great job �" in recs[f"{P}/docs/html-guide"]["body_md"]

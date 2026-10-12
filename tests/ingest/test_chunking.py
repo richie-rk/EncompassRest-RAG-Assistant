@@ -249,3 +249,30 @@ def test_merge_small_keeps_large_neighbours_apart():
     pieces = ["a" * 900, "b" * 900]
     assert _merge_small(pieces) == pieces
     assert _merge_small([]) == [] and _merge_small(["x"]) == ["x"]
+
+
+def test_orphans_attach_to_the_most_related_page_of_their_document():
+    """Several overview pages share one OAS document; an orphan goes to the
+    page whose name matches its path, not to whichever ranks first."""
+    oas = make_oas()
+    oas["paths"]["/gizmos"] = {"post": {"operationId": "create-gizmo", "summary": "Create Gizmo",
+                                        "responses": {"200": {"description": "OK"}}}}
+    recs = [
+        record("print-forms", title="Print Forms", type="basic", oas=oas,
+               body="A long overview of print forms. " * 4, breadcrumb=["Setup", "Print Forms"]),
+        record("gizmo", title="Gizmo", type="basic", oas=oas, body="Gizmos.",
+               breadcrumb=["Setup", "Gizmo"]),
+        record("get-widget", oas=oas, body="Notes."),
+        record("update-widget", oas=oas),
+    ]
+    chunks, report = chunk_corpus(recs)
+    by_op = {c.metadata["operation"]: c.metadata for c in chunks if c.metadata.get("orphan_operation")}
+    base = "https://docs.example.com/developer-connect/reference"
+    assert by_op["POST /gizmos"]["url"] == f"{base}/gizmo#create-gizmo"
+    assert by_op["POST /gizmos"]["breadcrumb"] == ["Setup", "Gizmo", "Create Gizmo"]
+    # widget operations go to the widget pages, not to an unrelated overview
+    assert by_op["GET /widgets"]["url"] == f"{base}/get-widget#list-widgets"
+    assert by_op[f"POST {ITEM}/archive"]["url"].startswith(f"{base}/get-widget#")
+    assert report.operations_total == report.operations_rendered == 6
+    ids = _ids(chunks)
+    assert len(ids) == len(set(ids))

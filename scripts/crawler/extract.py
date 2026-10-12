@@ -33,7 +33,7 @@ from typing import Any, Deque, Dict, Iterable, Iterator, List, Mapping, Optional
 
 from .htmlmd import html_to_markdown
 from .oas import find_page_operation, iter_operations, oas_fingerprint
-from .rewrite import find_component_placeholders, rewrite_body
+from .rewrite import MAX_REUSABLE_DEPTH, find_component_placeholders, rewrite_body
 from .sidebar import (
     FrontierEntry,
     SLUG_RE,
@@ -257,15 +257,43 @@ def _render_body(
     base_url: str,
     section: str,
 ) -> _Body:
-    names = _reusable_names(declared_reusable, raw_body)
-    reusable = find_reusable_content(ssr, names, exclude=exclude) if names else {}
+    reusable, unresolved = _resolve_reusable(
+        ssr, _reusable_names(declared_reusable, raw_body), exclude=exclude)
     md = rewrite_body(raw_body, base_url=base_url, section=section, reusable=reusable or None)
     return _Body(
         md=md, raw_chars=len(raw_body),
-        unresolved=[n for n in names if n not in reusable],
+        unresolved=unresolved,
         html_blocks=raw_body.count("[block:html]"),
         resolved_bodies=list(reusable.values()),
     )
+
+
+def _resolve_reusable(
+    ssr: Dict, names: List[str], *, exclude: Iterable[Any],
+) -> Tuple[Dict[str, str], List[str]]:
+    """Look up ``names`` and, transitively, the placeholders inside the bodies
+    found, level by level as deep as rewrite_body expands them
+    (MAX_REUSABLE_DEPTH). Returns ``(name -> body, unresolved names)``; a
+    nested name that cannot be found, or sits deeper than rewrite_body
+    expands, is unresolved too, because rewrite_body removes it."""
+    exclude = tuple(exclude)
+    reusable: Dict[str, str] = {}
+    unresolved: List[str] = []
+    pending = list(names)
+    for _ in range(MAX_REUSABLE_DEPTH):
+        if not pending:
+            break
+        found = find_reusable_content(ssr, pending, exclude=exclude)
+        reusable.update(found)
+        unresolved.extend(n for n in pending if n not in found)
+        nested: List[str] = []
+        for name in pending:
+            for inner in find_component_placeholders(found.get(name, "")):
+                if inner not in reusable and inner not in unresolved and inner not in nested:
+                    nested.append(inner)
+        pending = nested
+    unresolved.extend(n for n in pending if n not in unresolved)
+    return reusable, unresolved
 
 
 # --- record builders ------------------------------------------------------------
@@ -404,17 +432,24 @@ def _changelog_record(entry: FrontierEntry, match: Dict, ssr: Dict, source: str,
     raw_body = match.get("body") or ""
     body = _render_body(raw_body, ssr=ssr, declared_reusable=match.get("reusableContent"),
                         exclude=(match,), base_url=base_url, section=section)
+    title = match.get("title") or entry.title
+    # Entries found through a reference or a link only know their slug; their
+    # placeholder breadcrumb (["Release Notes", "<slug>"]) would end up in
+    # every chunk header. Navigation breadcrumbs are kept.
+    breadcrumb = list(entry.breadcrumb)
+    if not breadcrumb or breadcrumb[-1] == entry.slug:
+        breadcrumb = ["Release Notes", title]
     record = {
         "source": "developer_connect",
         "section": section,
         "kind": "changelog",
         "slug": match.get("slug") or entry.slug,
-        "title": match.get("title") or entry.title,
+        "title": title,
         "url": entry.url,
         "category": {"title": "Release Notes", "slug": "changelog", "type": "changelog",
                      "id": None},
         "parent_slug": None,
-        "breadcrumb": entry.breadcrumb,
+        "breadcrumb": breadcrumb,
         "hidden": bool(match.get("hidden", entry.hidden)),
         "deprecated": False,
         "type": match.get("type"),

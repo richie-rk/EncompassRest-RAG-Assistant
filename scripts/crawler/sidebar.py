@@ -38,10 +38,10 @@ import re
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
 
-from .fetch import Fetcher
+from .fetch import OFFLINE_CACHE_MISS, Fetcher
 
 SSR_PROPS_RE = re.compile(
     r'<script\b[^>]*\bid=["\']ssr-props["\'][^>]*>(.*?)</script>',
@@ -49,6 +49,15 @@ SSR_PROPS_RE = re.compile(
 )
 CHANGELOG_REF_RE = re.compile(r'\(changelog:([a-z0-9][a-z0-9._-]*)\)', re.IGNORECASE)
 SLUG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+# A JSON escape such as "\ud83d" (an emoji cut in half) decodes to a lone
+# surrogate, which cannot be written as UTF-8 and used to abort the crawl.
+# A high surrogate escape not followed by a low one, or a low one without a
+# high one before it (valid pairs decode to one character and are fine).
+_LONE_SURROGATE_ESCAPE_RE = re.compile(
+    r'\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})'
+    r'|(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}'
+)
+_LONE_SURROGATE_RE = re.compile('[\ud800-\udfff]')
 
 #: Every ``discovered_via`` value, most authoritative first.
 DISCOVERY_SOURCES: Tuple[str, ...] = (
@@ -94,12 +103,37 @@ class FrontierEntry:
 # --- helpers ------------------------------------------------------------------
 
 
+def _scrub_surrogates(value: Any) -> Any:
+    """``value`` with every lone UTF-16 surrogate replaced by U+FFFD.
+
+    After ``json.loads`` valid pairs are already combined into one character,
+    so any code point left in the surrogate range is a lone half.
+    """
+    if isinstance(value, str):
+        return _LONE_SURROGATE_RE.sub("\ufffd", value)
+    if isinstance(value, list):
+        return [_scrub_surrogates(v) for v in value]
+    if isinstance(value, dict):
+        return {_scrub_surrogates(k): _scrub_surrogates(v) for k, v in value.items()}
+    return value
+
+
+def load_json(text: str) -> Any:
+    """``json.loads`` whose strings are always writable as UTF-8: a lone
+    surrogate escape (``"\\ud83d"`` without its pair) becomes U+FFFD.
+    Used for ssr-props and for the JSON inside legacy ``[block:*]`` bodies."""
+    data = json.loads(text)
+    if _LONE_SURROGATE_ESCAPE_RE.search(text):
+        data = _scrub_surrogates(data)
+    return data
+
+
 def parse_ssr_props(html: str) -> Optional[Dict]:
     m = SSR_PROPS_RE.search(html or "")
     if not m:
         return None
     try:
-        data = json.loads(m.group(1))
+        data = load_json(m.group(1))
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
@@ -401,10 +435,15 @@ class ChangelogIndex:
     #: slug -> raw list item (title/body/...), used when a per-entry page
     #: does not carry its own entry.
     by_slug: Dict[str, Dict] = field(default_factory=dict)
-    pages: List[Dict] = field(default_factory=list)  # {url, http_status, new_slugs}
+    pages: List[Dict] = field(default_factory=list)  # {url, http_status, new_slugs, error, unexpected}
     truncated: bool = False
     max_pages: int = DEFAULT_CHANGELOG_MAX_PAGES
     skipped_hidden: int = 0
+    #: Pagination stopped on a failed fetch, not on the end of the list.
+    incomplete: bool = False
+    #: slug -> ``changelog_ref`` entry for slugs referenced in bodies but not
+    #: (yet) listed by the index; replaced if a later index page lists them.
+    ref_entries: Dict[str, FrontierEntry] = field(default_factory=dict)
 
 
 def changelog_entries_from_ssr(
@@ -417,11 +456,18 @@ def changelog_entries_from_ssr(
     skip_hidden: bool,
     out: ChangelogIndex,
 ) -> int:
-    """Add the ``changelogs`` list of one index page to ``out``; return new slugs."""
+    """Add the ``changelogs`` list of one index page to ``out``; return new slugs.
+
+    ``seen`` holds the slugs the index itself has listed so far. The page's
+    items are processed before the ``(changelog:slug)`` references in their
+    bodies, and a reference never counts as a listing: newer notes reference
+    older ones, and treating those as "seen" mislabelled the older entries,
+    left them out of ``by_slug`` and stopped pagination early. A slug first
+    seen as a reference and listed later is upgraded to ``changelog_index``.
+    """
+    items = [item for item in ssr.get("changelogs") or [] if isinstance(item, dict)]
     new = 0
-    for item in ssr.get("changelogs") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in items:
         slug = item.get("slug")
         if not slug or slug in seen or not SLUG_RE.match(str(slug)):
             continue
@@ -429,29 +475,39 @@ def changelog_entries_from_ssr(
         new += 1
         out.by_slug[slug] = item
         title = item.get("title") or slug
+        ref = out.ref_entries.pop(slug, None)
+        pos = None if ref is None else next(i for i, e in enumerate(out.entries) if e is ref)
+        if pos is not None:
+            del out.entries[pos]
         if item.get("hidden") and skip_hidden:
             out.skipped_hidden += 1
-        else:
-            out.entries.append(FrontierEntry(
-                slug=slug, url=page_url(base_url, section, "changelog", slug),
-                kind="changelog", title=title,
-                category_title="Release Notes", category_slug="changelog",
-                breadcrumb=["Release Notes", title],
-                hidden=bool(item.get("hidden", False)),
-                sidebar_meta={"type": item.get("type"), "updatedAt": item.get("updatedAt")},
-                discovered_via="changelog_index", source_url=source_url,
-            ))
+            continue
+        entry = FrontierEntry(
+            slug=slug, url=page_url(base_url, section, "changelog", slug),
+            kind="changelog", title=title,
+            category_title="Release Notes", category_slug="changelog",
+            breadcrumb=["Release Notes", title],
+            hidden=bool(item.get("hidden", False)),
+            sidebar_meta={"type": item.get("type"), "updatedAt": item.get("updatedAt")},
+            discovered_via="changelog_index", source_url=source_url,
+        )
+        if pos is None:
+            out.entries.append(entry)
+        else:  # keep the crawl position the reference gave it
+            out.entries.insert(pos, entry)
+    for item in items:
         for ref_slug in CHANGELOG_REF_RE.findall(item.get("body") or ""):
-            if ref_slug in seen:
+            if ref_slug in seen or ref_slug in out.ref_entries:
                 continue
-            seen.add(ref_slug)
-            out.entries.append(FrontierEntry(
+            ref = FrontierEntry(
                 slug=ref_slug, url=page_url(base_url, section, "changelog", ref_slug),
                 kind="changelog", title=ref_slug,  # real title comes from the page
                 category_title="Release Notes", category_slug="changelog",
                 breadcrumb=["Release Notes", ref_slug],
                 discovered_via="changelog_ref", source_url=source_url,
-            ))
+            )
+            out.ref_entries[ref_slug] = ref
+            out.entries.append(ref)
     return new
 
 
@@ -465,7 +521,14 @@ def enumerate_changelog(
 ) -> ChangelogIndex:
     """Walk ``/changelog``, ``?page=2``, ... until a page adds no new slug,
     is not a 200, has no ssr-props, or ``max_pages`` is reached (flagged as
-    ``truncated`` when the last page still produced new slugs)."""
+    ``truncated`` when the last page still produced new slugs).
+
+    Only a 404/410 (or, offline, a cache miss: 404s are never cached) past
+    page 1 is the normal end of the list. Any other failed fetch - a 5xx or
+    429 after retries, a network error, page 1 missing - loses every entry
+    after it, so the page is marked ``unexpected`` and the index
+    ``incomplete``; the crawler turns that into an unexpected failure.
+    """
     base_url = base_url.rstrip("/")
     index_url = f"{base_url}/{section}/changelog"
     out = ChangelogIndex(max_pages=max_pages)
@@ -478,6 +541,10 @@ def enumerate_changelog(
                      "error": getattr(res, "error", None)}
         out.pages.append(page_info)
         if res is None or status != 200:
+            offline_miss = getattr(res, "error", None) == OFFLINE_CACHE_MISS
+            if not (n > 1 and (status in (404, 410) or offline_miss)):
+                page_info["unexpected"] = True
+                out.incomplete = True
             break
         ssr = parse_ssr_props(res.html)
         if ssr is None:
@@ -505,6 +572,8 @@ class SitemapResult:
     ignored_urls: int = 0  # <loc>s outside the section's page URL space
     truncated: bool = False
     truncated_documents: List[str] = field(default_factory=list)
+    #: A sitemap document failed with a server/network error (not a 404).
+    incomplete: bool = False
 
 
 def _local(tag: str) -> str:
@@ -541,7 +610,10 @@ def enumerate_sitemap(
 ) -> SitemapResult:
     """Collect section page URLs from the site and section sitemaps.
 
-    Missing sitemaps (404, HTML instead of XML) are tolerated and recorded.
+    Missing sitemaps (a 4xx such as 404, HTML instead of XML, or offline a
+    cache miss) are tolerated and recorded. A server error (5xx, 429 after
+    retries) or a network error is not: the document is marked ``unexpected``
+    and the result ``incomplete`` so the crawler can fail the run.
     ``sitemapindex`` children on the same host are followed up to
     ``max_depth``/``max_documents``; anything left over is reported as
     truncated rather than silently dropped.
@@ -574,6 +646,10 @@ def enumerate_sitemap(
                       "error": getattr(res, "error", None)}
         out.documents.append(info)
         if res is None or status != 200:
+            transient = status is None or status == 429 or status >= 500
+            if transient and info["error"] != OFFLINE_CACHE_MISS:
+                info["unexpected"] = True
+                out.incomplete = True
             continue
         kind, locs = parse_sitemap(res.html)
         info["kind"], info["locs"] = kind, len(locs)

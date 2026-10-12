@@ -15,14 +15,19 @@ Outputs (default: next to --out):
     developer_connect_report.json      completeness report
 
 Never clobbers good data: every output is staged as ``<file>.partial`` and moved
-into place with ``os.replace`` only after the crawl completes. On an exception
-or Ctrl-C the previous files stay untouched and the partial files are kept for
-inspection.
+into place with ``os.replace`` only after the crawl completes (previous files
+are backed up while that happens and restored if a move fails). On an
+exception or Ctrl-C the previous files stay untouched and the partial files
+are kept for inspection. A run that would replace a published dataset with
+no records, or that had unexpected failures and lost more than
+``1 - PUBLISH_MIN_RECORD_RATIO`` of the published records, is not published
+either (``--force-publish`` overrides).
 
 Exit code: 0, or 1 when there were *unexpected* failures (see
-``UNEXPECTED_CLASSES``). Expected misses (OAS operationId guesses that 404,
-broken author links, auth-gated pages, offline cache misses) are reported but
-do not fail the run. 130 on Ctrl-C.
+``UNEXPECTED_CLASSES``) or the results were not published. Expected misses
+(OAS operationId guesses that 404, broken author links, auth-gated pages,
+offline cache misses of URLs that did not come from the site's navigation)
+are reported but do not fail the run. 130 on Ctrl-C.
 """
 from __future__ import annotations
 
@@ -30,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from collections import Counter, defaultdict
@@ -37,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, IO, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.markup import escape
@@ -71,7 +78,14 @@ DEFAULT_MAX_PAGES = 5000
 UNEXPECTED_CLASSES = frozenset({"not_found", "http_error", "network_error", "fetch_error",
                                 "extract_error"})
 #: ... and these only for URLs that came from the site's own navigation.
-UNEXPECTED_IF_NAVIGATION = frozenset({"no_ssr_props", "no_doc_or_custompage"})
+#: Offline, a navigation URL missing from the cache is a gap like a 404 online
+#: (a partly filled cache must not pass as a complete re-extraction).
+UNEXPECTED_IF_NAVIGATION = frozenset({"no_ssr_props", "no_doc_or_custompage",
+                                      "offline_cache_miss"})
+
+#: A run with unexpected failures that produced fewer than this share of the
+#: already published records is not published over them.
+PUBLISH_MIN_RECORD_RATIO = 0.9
 
 
 def default_data_dir() -> Path:
@@ -108,6 +122,16 @@ def _now_iso() -> str:
 
 def _norm(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _non_negative_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more (0 = no limit), got {value}")
+    return value
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -148,17 +172,18 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Refetch every URL even if cached")
     p.add_argument("--offline", action="store_true",
                    help="Never touch the network: re-extract from the HTML cache "
-                        "(uncached URLs are reported as offline cache misses)")
+                        "(uncached URLs are reported as offline cache misses; a miss on a "
+                        "URL from the site's navigation fails the run)")
     p.add_argument("--skip-hidden", action="store_true",
                    help="Exclude pages with hidden=true (sidebar, links, sitemap and OAS "
                         "seeds alike). Hidden pages are included by default.")
     p.add_argument("--include-hidden", action="store_true",
                    help="No-op, kept for backward compatibility (hidden pages are "
                         "included by default)")
-    p.add_argument("--limit", type=int, default=0,
+    p.add_argument("--limit", type=_non_negative_int, default=0,
                    help="Stop after N pages (debug; 0 = no limit). Disables discovery and "
                         "writes to *.sample.* files unless --out is given.")
-    p.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES,
+    p.add_argument("--max-pages", type=_non_negative_int, default=DEFAULT_MAX_PAGES,
                    help="Hard ceiling on the total frontier, all sources included "
                         f"(default: {DEFAULT_MAX_PAGES}; 0 = unlimited). URLs refused by "
                         "the cap are counted in the report.")
@@ -166,7 +191,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Disable discovery beyond the welcome sidebar and changelog index "
                         "(no sitemap, sidebar harvesting, OAS seeds or link following)")
     p.add_argument("--dry-run", action="store_true",
-                   help="Enumerate the seed frontier and exit; do not fetch pages or write files")
+                   help="Enumerate the seed frontier and exit. Only the seed documents "
+                        "(welcome page, changelog index, sitemaps) are fetched, from the "
+                        "cache when present; nothing is written, not even the cache")
+    p.add_argument("--force-publish", action="store_true",
+                   help="Replace the existing outputs even when the run produced no records, "
+                        "or had unexpected failures and far fewer records than the "
+                        "published dataset")
     args = p.parse_args(argv)
 
     if args.out is None:
@@ -185,6 +216,7 @@ def make_fetcher(args: argparse.Namespace) -> Fetcher:
         cache_dir=args.cache_dir / args.section,
         delay=args.delay, timeout=args.timeout, retries=args.retries,
         force_refresh=args.no_cache, offline=args.offline,
+        write_cache=not args.dry_run,
     )
 
 
@@ -217,9 +249,14 @@ def is_unexpected(error_class: str, via: str) -> bool:
 class StagedOutputs:
     """Write every output to ``<target>.partial`` and publish them together."""
 
+    #: Publish order. Registry first: records reference it by oas_id.
+    ORDER = ("oas", "records", "manifest", "report")
+
     def __init__(self, *, records: Path, manifest: Path, oas: Path, report: Path):
         self.targets = {"records": records, "manifest": manifest, "oas": oas, "report": report}
         self.partials = {k: v.with_name(v.name + ".partial") for k, v in self.targets.items()}
+        #: Targets left torn by a failed publish that could not be rolled back.
+        self.not_restored: List[Path] = []
         for path in self.targets.values():
             path.parent.mkdir(parents=True, exist_ok=True)
         self.records_f: IO[str] = self.partials["records"].open("w", encoding="utf-8")
@@ -242,7 +279,9 @@ class StagedOutputs:
         self._close()
         return [p for p in self.partials.values() if p.exists()]
 
-    def finish(self, *, records: List[Dict], registry: Dict[str, Dict], report: Dict) -> None:
+    def finish(self, *, records: List[Dict], registry: Dict[str, Dict], report: Dict,
+               publish: bool = True) -> None:
+        """Write the final partial files; move them into place if ``publish``."""
         self._close()
         # Final record list (duplicates merged), rewritten over the streamed copy.
         with self.partials["records"].open("w", encoding="utf-8") as f:
@@ -252,9 +291,51 @@ class StagedOutputs:
             json.dump({k: registry[k] for k in sorted(registry)}, f, ensure_ascii=False)
         with self.partials["report"].open("w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2, default=str)
-        # Registry first: records reference it by oas_id.
-        for key in ("oas", "records", "manifest", "report"):
-            os.replace(self.partials[key], self.targets[key])
+        if publish:
+            self._publish()
+
+    @staticmethod
+    def _backup(target: Path) -> Optional[Path]:
+        if not target.exists():
+            return None
+        backup = target.with_name(target.name + ".bak")
+        backup.unlink(missing_ok=True)
+        try:
+            os.link(target, backup)  # cheap, and the target is never missing
+        except OSError:
+            shutil.copy2(target, backup)
+        return backup
+
+    def _publish(self) -> None:
+        """Replace every target, or none: a failed move (e.g. a file held open
+        on Windows) restores the targets already replaced, so records never
+        end up next to a registry from another crawl."""
+        replaced: List[Tuple[str, Optional[Path]]] = []
+        backup: Optional[Path] = None
+        try:
+            for key in self.ORDER:
+                backup = self._backup(self.targets[key])
+                os.replace(self.partials[key], self.targets[key])
+                replaced.append((key, backup))
+                backup = None
+        except BaseException:
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+            self._rollback(replaced)
+            raise
+        for _, done in replaced:
+            if done is not None:
+                done.unlink(missing_ok=True)
+
+    def _rollback(self, replaced: List[Tuple[str, Optional[Path]]]) -> None:
+        for key, backup in reversed(replaced):
+            target, partial = self.targets[key], self.partials[key]
+            try:
+                os.replace(target, partial)  # the new output goes back to .partial
+                if backup is not None:
+                    os.replace(backup, target)
+            except OSError:
+                self.not_restored.append(target)
 
 
 # --- the crawl ------------------------------------------------------------------
@@ -340,6 +421,17 @@ class Crawl:
         final_url = getattr(res, "final_url", None)
         if final_url and url_key(final_url) != url_key(entry.url):
             row["final_url"] = final_url
+            if not self._in_section(final_url):
+                # Another project's (or site's) page: storing it under this
+                # URL, or walking its sidebar as ours, would be wrong.
+                row.update({"error": f"redirected outside the section to {final_url}"[:300],
+                            "error_class": "off_section_redirect"})
+                self.add_external([{"title": entry.title, "slug": entry.slug,
+                                    "url": final_url, "category": entry.category_title,
+                                    "source_url": entry.url,
+                                    "note": "section URL redirects outside the section"}])
+                self._fail(entry, row)
+                return
 
         try:
             ext = extract_page(
@@ -375,6 +467,29 @@ class Crawl:
             self._write_row(row)
 
         self._harvest(entry, ext)
+
+    def _in_section(self, url: str) -> bool:
+        target, base = urlparse(url_key(url)), urlparse(self.args.base_url.rstrip("/"))
+        return (target.netloc.lower() == base.netloc.lower()
+                and target.path.startswith(f"{base.path}/{self.args.section}/"))
+
+    def add_seed_failures(self) -> None:
+        """Failed changelog index pages and sitemap documents that cost
+        entries (see sidebar.enumerate_changelog/enumerate_sitemap) are
+        unexpected failures: everything listed after them is missing."""
+        docs = [("changelog_index", page) for page in self.seeds.changelog.pages]
+        if self.seeds.sitemap is not None:
+            docs += [("sitemap", doc) for doc in self.seeds.sitemap.documents]
+        for via, doc in docs:
+            if not doc.get("unexpected"):
+                continue
+            status, error = doc.get("http_status"), doc.get("error") or f"HTTP {doc.get('http_status')}"
+            self.failures.append({
+                "url": doc["url"], "slug": None, "kind": via, "discovered_via": via,
+                "source_url": None, "http_status": status, "error": str(error)[:300],
+                "error_class": classify_fetch_failure(status, error, via),
+                "seed_document": True, "unexpected": True,
+            })
 
     def _write_row(self, row: Dict) -> None:
         self.manifest_rows[row["url"]] = row
@@ -566,9 +681,11 @@ class Crawl:
             "duplicates": self.duplicates,
             "skipped_hidden": self.skipped_hidden,
             "changelog_index": {"pages": changelog.pages, "entries": len(changelog.by_slug),
-                                "skipped_hidden": changelog.skipped_hidden},
+                                "skipped_hidden": changelog.skipped_hidden,
+                                "incomplete": changelog.incomplete},
             "sitemap": ({"documents": sitemap.documents, "page_urls": len(sitemap.entries),
-                         "ignored_urls": sitemap.ignored_urls}
+                         "ignored_urls": sitemap.ignored_urls,
+                         "incomplete": sitemap.incomplete}
                         if sitemap is not None else None),
             "cap_truncations": {
                 "max_pages": {"cap": self.frontier.max_pages,
@@ -625,6 +742,14 @@ def _print_summary(report: Dict) -> None:
         console.print(f"  [bold red]max-pages cap {cap['max_pages']['cap']} dropped "
                       f"{cap['max_pages']['not_enqueued']} URLs: "
                       f"{cap['max_pages']['by_source']}[/bold red]")
+    if report["changelog_index"]["incomplete"]:
+        page = [p for p in report["changelog_index"]["pages"] if p.get("unexpected")][-1]
+        detail = page.get("error") or f"HTTP {page.get('http_status')}"
+        console.print(f"  [bold red]changelog index incomplete: {escape(str(page['url']))} "
+                      f"failed ({escape(str(detail))}); later entries are missing[/bold red]")
+    if report["sitemap"] and report["sitemap"]["incomplete"]:
+        failed = [d["url"] for d in report["sitemap"]["documents"] if d.get("unexpected")]
+        console.print(f"  [bold red]sitemap documents failed: {escape(str(failed))}[/bold red]")
     if cap["changelog_index"]["truncated"]:
         console.print(f"  [bold red]changelog index stopped at its "
                       f"{cap['changelog_index']['cap']}-page cap[/bold red]")
@@ -633,10 +758,40 @@ def _print_summary(report: Dict) -> None:
                       f"{len(cap['sitemap']['documents_not_fetched'])}[/bold red]")
 
 
-def _print_partials(paths: List[Path]) -> None:
-    console.print("[yellow]Previous output files were left untouched. Partial results:[/yellow]")
+def _print_partials(paths: List[Path], staged: Optional[StagedOutputs] = None) -> None:
+    torn = staged.not_restored if staged is not None else []
+    if torn:
+        console.print("[bold red]Publishing failed and these outputs could not be restored "
+                      "(their previous version is next to them as *.bak):[/bold red]")
+        for p in torn:
+            console.print(f"  {escape(str(p))}")
+    else:
+        console.print("[yellow]Previous output files were left untouched.[/yellow]")
+    console.print("[yellow]Partial results:[/yellow]")
     for p in paths:
         console.print(f"  {escape(str(p))}")
+
+
+def _count_lines(path: Path) -> int:
+    try:
+        with path.open("rb") as f:
+            return sum(block.count(b"\n") for block in iter(lambda: f.read(1 << 20), b""))
+    except OSError:
+        return 0
+
+
+def publish_blocked_reason(*, records: int, previous: int, exit_code: int) -> Optional[str]:
+    """Why this run must not replace a published dataset of ``previous``
+    records, or None. Guards against e.g. an --offline run over a partly
+    filled cache, or a crawl during a network outage."""
+    if previous <= 0:
+        return None
+    if records == 0:
+        return f"the run produced no records ({previous} are published)"
+    if exit_code and records < previous * PUBLISH_MIN_RECORD_RATIO:
+        return (f"the run had unexpected failures and produced {records} records, fewer than "
+                f"{PUBLISH_MIN_RECORD_RATIO:.0%} of the {previous} already published")
+    return None
 
 
 # --- main -------------------------------------------------------------------------
@@ -710,6 +865,7 @@ def main(argv: List[str] | None = None, *, fetcher: Any = None) -> int:
     crawl = Crawl(args=args, fetcher=fetcher, frontier=frontier, seeds=seeds,
                   discover=discover, staged=staged)
     crawl.add_external(seeds.welcome.external_links)
+    crawl.add_seed_failures()
 
     try:
         with Progress(
@@ -730,17 +886,31 @@ def main(argv: List[str] | None = None, *, fetcher: Any = None) -> int:
                 bar.advance(task)
         records = crawl.final_records()
         report = crawl.build_report(records, started=started)
-        staged.finish(records=records, registry=crawl.registry, report=report)
+        blocked = None if args.force_publish else publish_blocked_reason(
+            records=len(records), previous=_count_lines(args.out),
+            exit_code=report["exit_code"])
+        report["published"] = blocked is None
+        if blocked:
+            report["not_published_reason"] = blocked
+            report["exit_code"] = 1
+        staged.finish(records=records, registry=crawl.registry, report=report,
+                      publish=blocked is None)
     except KeyboardInterrupt:
         console.print("\n[red]Interrupted.[/red]")
-        _print_partials(staged.abort())
+        _print_partials(staged.abort(), staged)
         return 130
     except BaseException:
         console.print("\n[red]Crawl failed.[/red]")
-        _print_partials(staged.abort())
+        _print_partials(staged.abort(), staged)
         raise
 
     _print_summary(report)
+    if blocked:
+        console.print(f"\n  [bold red]NOT published: {escape(blocked)}.[/bold red]")
+        _print_partials(staged.abort(), staged)
+        console.print("  [yellow]Fix the cause and re-run (cached pages are reused), or pass "
+                      "--force-publish to replace the outputs anyway.[/yellow]")
+        return 1
     console.print(f"\n  [green]Wrote {args.out}[/green]")
     console.print(f"  [green]Wrote {args.manifest}[/green]")
     console.print(f"  [green]Wrote {args.oas_out}[/green]")

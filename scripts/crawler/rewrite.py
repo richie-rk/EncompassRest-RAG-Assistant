@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from .htmlmd import collapse_blank_lines, fence_for, html_to_markdown, split_fenced_code
+from .sidebar import load_json
 
 __all__ = [
     "MAX_REUSABLE_DEPTH",
@@ -58,10 +59,13 @@ _KIND = r"(?P<kind>doc|ref|changelog|page)"
 _SLUG = r"(?P<slug>[A-Za-z0-9][A-Za-z0-9._~-]*)"
 _ANCHOR = r"(?P<anchor>#[^\s()<>\"']*)?"
 
-# "(doc:slug#a)", "(<ref: slug>)", "]\(ref: slug)" (escaped by ReadMe's
-# editor), optionally with a link title: "(doc:slug "Title")".
+# "[x](doc:slug#a)", "[x](<ref: slug>)", "[x]\(ref: slug)" (escaped by
+# ReadMe's editor), optionally with a link title: "(doc:slug "Title")". Only
+# in link-destination position - right after "]" (or "]\") - or in the
+# unambiguous "(<kind:slug>)" form: prose such as "the 1003 form (page: 2)"
+# is not a link and must not become a URL.
 LINK_MACRO_RE = re.compile(
-    r"(?:(?<=\])\\)?\(\s*(?P<lt><)?\s*" + _KIND + r":\s*" + _SLUG + _ANCHOR
+    r"(?:(?<=\])\\?\(|\((?=\s*<))\s*(?P<lt><)?\s*" + _KIND + r":\s*" + _SLUG + _ANCHOR
     + r"\s*(?(lt)>)\s*(?P<title>\"[^\"\n]*\"|'[^'\n]*')?\s*\)"
 )
 # "[label]: doc:slug" link reference definitions.
@@ -95,11 +99,13 @@ _BUILTIN_COMPONENTS = frozenset({"Image", "Embed"})
 LEGACY_BLOCK_RE = re.compile(
     r"\[block:(?P<type>[A-Za-z0-9_-]+)\](?P<inner>.*?)\[/block\]", re.S
 )
-# Container prefix of a line: blockquote markers, indentation, one list marker.
-_CONTAINER_PREFIX_RE = re.compile(
-    r"^(?P<quote>(?:[ \t]*>[ \t]?)*)(?P<indent>[ \t]*)(?P<marker>(?:[-*+]|\d{1,9}[.)])[ \t]+)?$"
-)
+# Container prefix of a line: indentation and any mix of blockquote markers
+# and list markers ("> ", "1. ", "- > ", "- - ", "> - ").
+_CONTAINER_PREFIX_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])[ \t]))*[ \t]*$")
+_LIST_MARKER_RE = re.compile(r"(?:[-*+]|\d{1,9}[.)])(?=[ \t])")
 _QUOTE_MARKERS_RE = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)
+_TABLE_EDGE_RE = re.compile(r"^(?:[ \t]*>)*[ \t]*\|")
+_ATX_HEADING_RE = re.compile(r"^(?:[ \t]*>)*[ \t]{0,3}#{1,6}[ \t]")
 
 _BACKTICKS_RE = re.compile(r"`+")
 _BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
@@ -204,12 +210,20 @@ def _split_inline_code(text: str) -> List[Tuple[bool, str]]:
     pos = i = 0
     while i < len(runs):
         start, end = runs[i]
-        if start and text[start - 1] == "\\":  # escaped backtick: literal
-            i += 1
-            continue
+        # An odd number of backslashes escapes the run's first backtick (an
+        # even number is escaped backslashes); the rest of the run can still
+        # open a span. Backslashes inside the previous span do not count.
+        j = start
+        while j > pos and text[j - 1] == "\\":
+            j -= 1
+        if (start - j) % 2:
+            start += 1
+            if start == end:
+                i += 1
+                continue
         b = bisect_left(blanks, end)
         limit = blanks[b] if b < len(blanks) else len(text)
-        same = by_width[end - start]
+        same = by_width.get(end - start, [])
         k = bisect_right(same, i)
         if k == len(same) or runs[same[k]][0] >= limit:
             i += 1  # unmatched run is literal text
@@ -239,13 +253,13 @@ def _prose_pieces(text: str) -> List[str]:
 def _continuation(prefix: str) -> Optional[str]:
     """Prefix that keeps later lines inside the container ``prefix`` opened.
 
-    ``"> "`` -> ``"> "``, ``"   "`` -> ``"   "``, ``"1. "`` -> ``"   "``.
+    ``"> "`` -> ``"> "``, ``"   "`` -> ``"   "``, ``"1. "`` -> ``"   "``,
+    ``"- > "`` -> ``"  > "``: list markers become spaces, quote markers stay.
     Returns None when the prefix contains prose (the insertion is mid-line).
     """
-    m = _CONTAINER_PREFIX_RE.match(prefix)
-    if m is None:
+    if _CONTAINER_PREFIX_RE.match(prefix) is None:
         return None
-    return m["quote"] + m["indent"] + " " * len(m["marker"] or "")
+    return _LIST_MARKER_RE.sub(lambda m: " " * len(m[0]), prefix)
 
 
 def _continue_lines(md: str, cont: str) -> str:
@@ -269,13 +283,22 @@ def _place_block(md: str, s: str, start: int, end: int) -> str:
     Alone on its line, the content follows the line's container (list item,
     blockquote) and is separated from neighbouring paragraphs by blank lines.
     Next to other text, a one-line result stays inline and a multi-line one
-    is split out into its own paragraph.
+    is split out into its own paragraph - except in a table row, where it is
+    flattened into the cell (``<br>`` line breaks, escaped pipes), and in an
+    ATX heading, where its lines are joined with spaces: splitting either
+    one breaks the table or empties the heading.
     """
     prefix, suffix = _line_context(s, start, end)
     cont = _continuation(prefix)
     if "\n" not in md and (cont is None or suffix.strip()):
         return md
     if cont is None:
+        if _TABLE_EDGE_RE.match(prefix) or (
+            _UNESCAPED_PIPE_RE.search(prefix) and _UNESCAPED_PIPE_RE.search(suffix)
+        ):
+            return format_table_cell(md)
+        if _ATX_HEADING_RE.match(prefix):
+            return _one_line(md)
         return f"\n\n{md}\n\n"
     trailer = "\n" + cont if suffix.strip() else ""
     if not cont:
@@ -334,7 +357,9 @@ def _parse_attrs(attrs: str) -> Dict[str, str]:
 def _builtin_component(name: str, attrs: str) -> str:
     a = _parse_attrs(attrs)
     if name == "Image" and a.get("src"):
-        alt = a.get("alt") or a.get("caption") or a.get("title") or ""
+        # The caption is the text readers see; alt is often a file name.
+        # Same order as the legacy [block:image] renderer.
+        alt = a.get("caption") or a.get("alt") or a.get("title") or ""
         return _image_md(a["src"], alt)
     if name == "Embed" and (a.get("url") or a.get("href")):
         url = a.get("url") or a.get("href") or ""
@@ -422,7 +447,7 @@ def _replace_block(m: "re.Match[str]", ctx: _Ctx) -> str:
 
 def _render_block(block_type: str, inner: str, ctx: _Ctx) -> str:
     try:
-        data = json.loads(inner)
+        data = load_json(inner)  # never yields lone surrogates (unwritable as UTF-8)
     except ValueError:
         return inner.strip()
     renderer = _BLOCK_RENDERERS.get(block_type.lower())

@@ -29,8 +29,12 @@ Corpus-level rules (`chunk_corpus` / `chunk_records`):
     is shown in full once and referenced (with its field names) afterwards.
   - Operations present in some OAS document but documented by no page
     ("orphans") are rendered once at the end, attached to a representative
-    page of a document containing them (a `basic` overview page if possible)
-    under `<page url>#<operationId>`, so `(url, chunk_index)` stays unique.
+    page of a document containing them under `<page url>#<operationId>`, so
+    `(url, chunk_index)` stays unique. The representative is the page most
+    related to the operation's path: most path words (`/v3/loanFolders/{id}`
+    -> loan, folder; words every path of the document shares do not count)
+    in its slug, title or own operation's path; ties go to a `basic`
+    overview page, then to preference order.
 
 A record's OAS document is `record["oas"]` (legacy datasets embed it) or
 `oas_registry[record["oas_id"]]` (current crawler output stores each distinct
@@ -120,6 +124,8 @@ _SPLITTER = RecursiveCharacterTextSplitter(
 _TAG_RE = re.compile(r"<[^>]*>")
 _NEWLINE_RUN_RE = re.compile(r"\s*\n\s*")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+_VERSION_RE = re.compile(r"^v\d+$")
 
 
 # --- Record inputs --------------------------------------------------------------
@@ -156,6 +162,7 @@ class _RecordText:
     overview_hash: Optional[str] = None     # overview included in `text`
     prose: bool = False                     # endpoint body_md included
     no_operation: bool = False              # endpoint page with no identifiable operation
+    documented: Optional[OpKey] = None      # operation the page documents (rendered or not)
 
 
 def _overview_once(oas: Optional[Dict], ledger: Optional[RenderLedger]) -> Tuple[str, Optional[str]]:
@@ -181,6 +188,7 @@ def _build_record_text(
         hit = page_operation(record, oas)
         if hit is not None:
             key = (hit[0].upper(), hit[1])
+            out.documented = key
             if ledger is None or key not in ledger.operations:
                 md = synthesize_operation_markdown(
                     oas, hit[0], hit[1], doc_api=record.get("doc_api"),
@@ -387,6 +395,50 @@ def _slugify(text: str) -> str:
     return _SLUG_RE.sub("-", text.lower()).strip("-")
 
 
+def _words(text: str) -> Set[str]:
+    """Lowercase words of a slug, title or path segment (camelCase split,
+    naive singular: "loanFolders" -> {"loan", "folder"})."""
+    out: Set[str] = set()
+    for word in _WORD_RE.findall(text or ""):
+        word = word.lower()
+        if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+        out.add(word)
+    return out
+
+
+def _path_words(path: str) -> Set[str]:
+    words: Set[str] = set()
+    for segment in path.split("/"):
+        if segment and not segment.startswith("{") and not _VERSION_RE.match(segment.lower()):
+            words |= _words(segment)
+    return words
+
+
+# (preference index, record, its OAS document, method, operation object, documented op)
+_Candidate = Tuple[int, Mapping[str, Any], Dict, str, Dict, Optional[OpKey]]
+
+
+def _representative(key: OpKey, candidates: Sequence[_Candidate]) -> _Candidate:
+    """The record an orphan operation is attached to (see the module docstring)."""
+    wanted = _path_words(key[1])
+    paths = list(candidates[0][2].get("paths") or {}) if wanted else []
+    if len(paths) > 1:  # words in every path of the document say nothing
+        wanted -= set.intersection(*(_path_words(p) for p in paths))
+
+    def rank(c: _Candidate) -> Tuple[int, bool, int]:
+        idx, record, _, _, _, documented = c
+        score = 0
+        if wanted:
+            words = _words(str(record.get("slug") or "")) | _words(str(record.get("title") or ""))
+            if documented is not None:
+                words |= _path_words(documented[1])
+            score = len(wanted & words)
+        return score, record.get("type") == "basic", -idx
+
+    return max(candidates, key=rank)
+
+
 def chunk_corpus(
     records: Sequence[Dict], oas_registry: Optional[Mapping[str, Dict]] = None,
 ) -> Tuple[List[Chunk], ChunkReport]:
@@ -399,10 +451,10 @@ def chunk_corpus(
     ledger = RenderLedger()
     chunks: List[Chunk] = []
     seen_urls: Set[str] = set()
-    # op -> (representative record, its OAS document, method, operation object)
-    op_sources: Dict[OpKey, Tuple[Mapping[str, Any], Dict, str, Dict]] = {}
+    # op -> every record whose OAS document has it (orphan representatives)
+    op_sources: Dict[OpKey, List[_Candidate]] = {}
 
-    for record in order_records(records):
+    for idx, record in enumerate(order_records(records)):
         url = record.get("url") or ""
         if url in seen_urls:
             report.records_skipped_duplicate_url += 1
@@ -423,19 +475,17 @@ def chunk_corpus(
             report.endpoint_pages_without_operation += int(built.no_operation)
 
         if oas:
-            is_basic = record.get("type") == "basic"
             for method, path, op in iter_operations(oas):
-                key = (method.upper(), path)
-                current = op_sources.get(key)
-                if current is None or (is_basic and current[0].get("type") != "basic"):
-                    op_sources[key] = (record, oas, method, op)
+                op_sources.setdefault((method.upper(), path), []).append(
+                    (idx, record, oas, method, op, built.documented))
 
     report.operations_total = len(op_sources)
     pages_rendered = sum(1 for key in op_sources if key in ledger.operations)
 
-    for key, (rep, oas, method, op) in op_sources.items():
+    for key, candidates in op_sources.items():
         if key in ledger.operations:
             continue
+        _, rep, oas, method, op, _ = _representative(key, candidates)
         md = synthesize_operation_markdown(oas, method, key[1], seen_blocks=ledger.blocks)
         if not md:
             continue

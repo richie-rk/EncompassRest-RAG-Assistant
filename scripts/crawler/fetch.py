@@ -14,6 +14,13 @@ Why the extra care:
     A crash mid-write used to leave a truncated file that every later run
     treated as a valid cache hit. As a belt-and-braces check, a cached HTML
     file with no closing ``</html>``/``</body>`` tag is refetched when online.
+    Cache files get the usual umask-based mode (``mkstemp`` alone would make
+    them owner-only, unreadable to another user or container reusing them).
+  * A response that was redirected keeps its final URL in a small sidecar
+    file (``<cache file>.final-url``), so cache hits and ``--offline`` runs
+    report the redirect too (the crawler must know a page actually came from
+    elsewhere).
+  * ``write_cache=False`` (``--dry-run``) fetches without writing anything.
   * 429/5xx responses honour ``Retry-After`` (seconds or HTTP-date, capped),
     and when retries run out the last status code is returned instead of
     being lost. No sleep happens after the final attempt.
@@ -53,6 +60,7 @@ MAX_RETRY_AFTER_SECONDS = 60.0
 OFFLINE_CACHE_MISS = "offline cache miss"
 
 _RESOURCE_DIR = "_resources"
+_FINAL_URL_SUFFIX = ".final-url"
 _SAFE_QUERY_RE = re.compile(r"[^A-Za-z0-9._=-]")
 _MAX_SEGMENT = 180
 
@@ -116,6 +124,18 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_UMASK: Optional[int] = None
+
+
+def _file_mode() -> int:
+    """``0o666`` minus the process umask: the mode ``open()`` would give."""
+    global _UMASK
+    if _UMASK is None:
+        _UMASK = os.umask(0)
+        os.umask(_UMASK)
+    return 0o666 & ~_UMASK
+
+
 def _shorten(segment: str) -> str:
     if len(segment) <= _MAX_SEGMENT:
         return segment
@@ -137,9 +157,13 @@ class Fetcher:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         max_retry_after: float = MAX_RETRY_AFTER_SECONDS,
+        write_cache: bool = True,
     ):
         self.cache_dir = Path(cache_dir)
-        if not offline:  # offline runs only read; they must not create anything
+        # Offline runs only read; write_cache=False (--dry-run) fetches live
+        # but must not create anything either.
+        self.write_cache = write_cache and not offline
+        if self.write_cache:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.delay = delay
         self.timeout = timeout
@@ -217,6 +241,7 @@ class Fetcher:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(text)
+            os.chmod(tmp_name, _file_mode())  # mkstemp creates 0600
             os.replace(tmp_name, path)
         except BaseException:
             try:
@@ -224,6 +249,29 @@ class Fetcher:
             except OSError:
                 pass
             raise
+
+    @staticmethod
+    def _final_url_path(path: Path) -> Path:
+        return path.with_name(path.name + _FINAL_URL_SUFFIX)
+
+    def _read_final_url(self, path: Path) -> Optional[str]:
+        text = self._read_cache(self._final_url_path(path))
+        return (text or "").strip() or None
+
+    def _store(self, path: Path, text: str, *, url: str, final_url: Optional[str]) -> None:
+        """Cache a 200 response together with where it was finally served from."""
+        marker = self._final_url_path(path)
+        if final_url and final_url != url:
+            # Marker first: a crash in between must not leave a redirected
+            # page in the cache looking like the requested one.
+            self._write_cache(marker, final_url)
+            self._write_cache(path, text)
+            return
+        self._write_cache(path, text)
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
 
     # -- public API ------------------------------------------------------------
 
@@ -261,6 +309,7 @@ class Fetcher:
                 return FetchResult(
                     url=url, html=cached, http_status=200, cache_hit=True,
                     body_hash=_sha256(cached), cache_path=path,
+                    final_url=self._read_final_url(path),
                 )
 
         if self.offline:
@@ -306,8 +355,9 @@ class Fetcher:
                 )
 
             text = resp.text
-            self._write_cache(path, text)
-            self._refreshed.add(url)
+            if self.write_cache:
+                self._store(path, text, url=url, final_url=final_url)
+                self._refreshed.add(url)
             return FetchResult(
                 url=url, html=text, http_status=200, cache_hit=False,
                 body_hash=_sha256(text), cache_path=path,

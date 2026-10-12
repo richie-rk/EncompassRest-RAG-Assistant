@@ -1,8 +1,11 @@
 """Frontier discovery: sidebars, frontier de-dup/caps, changelog pagination, sitemaps."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from scripts.crawler.fetch import OFFLINE_CACHE_MISS
 from scripts.crawler.sidebar import (
     Frontier,
     FrontierEntry,
@@ -289,3 +292,103 @@ def test_unusual_sidebar_slugs_are_quoted_or_reported():
     reported = {link["slug"] for link in walk.external_links}
     assert reported == {"a/b", ".."}
     assert all(link["url"] is None for link in walk.external_links)
+
+
+# --- regressions --------------------------------------------------------------
+
+
+def test_changelog_references_do_not_hide_later_index_entries():
+    """Newer notes reference older ones. A reference must not count as the
+    index listing that slug: the entry stays changelog_index (with its real
+    title), lands in by_slug, and pagination is not cut short when a page
+    only lists already-referenced slugs."""
+    fetcher = FakeFetcher({
+        f"{P}/changelog": _cl("r3", "r2", bodies={"r3": "see [r2](changelog:r2) "
+                                                        "and [r0](changelog:r0)"}),
+        f"{P}/changelog?page=2": _cl("r1", bodies={"r1": "[r0](changelog:r0)"}),
+        f"{P}/changelog?page=3": _cl("r0"),  # every item here was referenced before
+        f"{P}/changelog?page=4": _cl("rm1"),
+        f"{P}/changelog?page=5": _cl(),
+    })
+    idx = enumerate_changelog(fetcher, base_url=BASE, section=SEC)
+    assert [(e.slug, e.discovered_via) for e in idx.entries] == [
+        ("r3", "changelog_index"), ("r2", "changelog_index"),
+        ("r0", "changelog_index"),  # upgraded in place of its reference
+        ("r1", "changelog_index"), ("rm1", "changelog_index")]
+    r0 = idx.entries[2]
+    assert r0.title == "R0" and r0.breadcrumb == ["Release Notes", "R0"]
+    assert r0.source_url == f"{P}/changelog?page=3"
+    assert set(idx.by_slug) == {"r3", "r2", "r1", "r0", "rm1"}
+    assert [p["new_slugs"] for p in idx.pages] == [2, 1, 1, 1, 0]
+    assert f"{P}/changelog?page=4" in fetcher.calls
+    assert idx.ref_entries == {}
+
+
+def test_changelog_reference_to_hidden_entry_is_dropped_with_skip_hidden():
+    fetcher = FakeFetcher({
+        f"{P}/changelog": _cl("r2", bodies={"r2": "[r1](changelog:r1)"}),
+        f"{P}/changelog?page=2": _cl("r1", hidden={"r1"}),
+        f"{P}/changelog?page=3": _cl(),
+    })
+    idx = enumerate_changelog(fetcher, base_url=BASE, section=SEC, skip_hidden=True)
+    assert [e.slug for e in idx.entries] == ["r2"]
+    assert idx.skipped_hidden == 1 and "r1" in idx.by_slug
+
+
+@pytest.mark.parametrize("pages,unexpected", [
+    ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 503}, True),
+    ({f"{P}/changelog": 503}, True),
+    ({}, True),  # the index itself is gone (404 on page 1)
+    ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 429}, True),
+    ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 404}, False),  # end of the list
+    ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 410}, False),
+])
+def test_changelog_index_failure_is_flagged_not_mistaken_for_the_end(pages, unexpected):
+    idx = enumerate_changelog(FakeFetcher(pages), base_url=BASE, section=SEC)
+    assert idx.incomplete is unexpected
+    assert bool(idx.pages[-1].get("unexpected")) is unexpected
+
+
+def test_changelog_offline_cache_miss_past_page_one_ends_the_list():
+    class Offline(FakeFetcher):
+        def fetch(self, url):
+            res = super().fetch(url)
+            if res.http_status == 404:
+                res.http_status, res.error = None, OFFLINE_CACHE_MISS
+            return res
+
+    idx = enumerate_changelog(Offline({f"{P}/changelog": _cl("r1")}), base_url=BASE, section=SEC)
+    assert not idx.incomplete and [e.slug for e in idx.entries] == ["r1"]
+    idx = enumerate_changelog(Offline({}), base_url=BASE, section=SEC)
+    assert idx.incomplete and idx.pages[0]["unexpected"]
+
+
+def test_sitemap_server_error_is_flagged_but_missing_sitemap_is_not():
+    resources = {
+        f"{BASE}/sitemap.xml": 404,
+        f"{P}/sitemap.xml": _index(f"{P}/s1.xml", f"{P}/s2.xml", f"{P}/s3.xml"),
+        f"{P}/s1.xml": 503,
+        f"{P}/s2.xml": 403,
+        f"{P}/s3.xml": _urlset(f"{P}/docs/a"),
+    }
+    res = enumerate_sitemap(FakeFetcher({}, resources), base_url=BASE, section=SEC)
+    assert res.incomplete
+    flagged = {d["url"] for d in res.documents if d.get("unexpected")}
+    assert flagged == {f"{P}/s1.xml"}
+    assert [e.url for e in res.entries] == [f"{P}/docs/a"]
+
+    resources[f"{P}/s1.xml"] = 404
+    res = enumerate_sitemap(FakeFetcher({}, resources), base_url=BASE, section=SEC)
+    assert not res.incomplete
+
+
+def test_parse_ssr_props_replaces_lone_surrogates():
+    # an emoji cut in half by a JS substring: "\ud83d" alone is valid JSON
+    html = ('<script id="ssr-props" type="application/json">'
+            '{"doc": {"body": "Great job \\ud83d", "ok": "\\ud83d\\ude00", "\\udc00k": 1}}'
+            '</script>')
+    data = parse_ssr_props(html)
+    assert data["doc"]["body"] == "Great job �"
+    assert data["doc"]["ok"] == "\U0001F600"  # a valid pair is untouched
+    assert data["doc"]["�k"] == 1
+    json.dumps(data, ensure_ascii=False).encode("utf-8")  # writable as UTF-8

@@ -1,6 +1,8 @@
 """Fetcher: cache layout and atomicity, offline mode, retries, Retry-After."""
 from __future__ import annotations
 
+import os
+import stat
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -274,3 +276,44 @@ def test_fetch_resource_uses_xml_accept_and_separate_cache(tmp_path):
     assert res.cache_path == tmp_path / "cache" / "_resources" / "dc" / "sitemap.xml"
     again = f.fetch_resource(url)
     assert again.cache_hit and again.html == xml
+
+
+# --- regressions ----------------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+def test_cache_files_get_the_umask_mode_not_owner_only(tmp_path):
+    old = os.umask(0o022)
+    fetch_mod._UMASK = None  # re-read the umask set for this test
+    try:
+        f, _ = make(tmp_path, FakeSession([FakeResponse(200, PAGE)]))
+        res = f.fetch(URL)
+        assert stat.S_IMODE(res.cache_path.stat().st_mode) == 0o644
+    finally:
+        os.umask(old)
+        fetch_mod._UMASK = None
+
+
+def test_redirect_target_survives_cache_hits_and_offline_runs(tmp_path):
+    moved = "https://dev.example.com/other/docs/partner"
+    session = FakeSession([FakeResponse(200, PAGE, url=moved), FakeResponse(200, PAGE)])
+    f, _ = make(tmp_path, session)
+    assert f.fetch(URL).final_url == moved
+    hit = f.fetch(URL)
+    assert hit.cache_hit and hit.final_url == moved
+    offline, _ = make(tmp_path, NoNetwork(), offline=True)
+    assert offline.fetch(URL).final_url == moved
+    # once the URL stops redirecting the marker is dropped
+    refresh, _ = make(tmp_path, session, force_refresh=True)
+    assert refresh.fetch(URL).final_url == URL
+    assert f.fetch(URL).final_url is None
+    assert sorted(p.name for p in f.cache_path_for(URL).parent.iterdir()) == ["welcome.html"]
+
+
+def test_write_cache_false_fetches_without_writing_anything(tmp_path):
+    session = FakeSession([FakeResponse(200, PAGE), FakeResponse(200, PAGE)])
+    f, _ = make(tmp_path, session, write_cache=False)
+    assert f.fetch(URL).html == PAGE
+    assert f.fetch(URL).html == PAGE  # not cached, so fetched again
+    assert len(session.calls) == 2
+    assert not (tmp_path / "cache").exists()

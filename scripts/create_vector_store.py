@@ -230,7 +230,7 @@ def build_documents(
     backfilled = _backfill_discovered_via(records, man_path)
 
     filtered = _filter_records(records, skip_hidden=skip_hidden)
-    kept, dropped = dedupe_by_content(filtered)
+    kept, dropped = dedupe_by_content(filtered, registry)
     chunks, report = chunk_corpus(kept, registry)
     documents = _chunks_to_documents(chunks)
     _validate_unique_ids(documents)

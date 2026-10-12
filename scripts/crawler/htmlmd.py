@@ -7,9 +7,12 @@ simply deleted those bodies, which emptied several guides. markdownify does
 the heavy lifting; this module adds the few tweaks needed for clean,
 retrieval-friendly Markdown:
 
-  - script/style/svg/noscript/iframe/template, the document <head> and form
-    controls (button, input, select/option, textarea) are removed together
-    with their contents: their text is code or UI chrome, not documentation;
+  - script/style/svg/noscript/iframe/template, the head-only elements
+    (title/meta/link/base) and form controls (button, input, select/option,
+    textarea) are removed together with their contents: their text is code or
+    UI chrome, not documentation. <head> itself is only unwrapped: HTML5 lets
+    a document omit ``</head>``, and html.parser then nests the whole body
+    inside it;
   - <pre> becomes a fenced block whose fence is longer than any backtick run
     inside the code and whose info string carries the language from
     ``language-*`` / ``lang-*`` class names;
@@ -39,11 +42,14 @@ __all__ = ["collapse_blank_lines", "fence_for", "html_to_markdown", "split_fence
 
 # --- Fenced code ------------------------------------------------------------
 
-# Opening fence: optional container prefix (indentation, blockquote markers,
-# one list marker) then 3+ backticks or tildes. Real bodies have fences
-# indented inside list items and quoted inside blockquotes ("> ```json").
+# Opening fence: optional container prefix (indentation and any mix of
+# blockquote markers and list markers, e.g. "- > " or "- - " for a fence
+# opening a quoted or nested list item) then 3+ backticks or tildes. Real
+# bodies have fences indented inside list items and quoted inside
+# blockquotes ("> ```json"), and html_to_markdown emits "- > ```" and
+# "- - ```" for <pre> at the start of a nested <li>/<blockquote>.
 _FENCE_OPEN_RE = re.compile(
-    r"^(?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?"
+    r"^(?:[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])[ \t]))*[ \t]*"
     r"(?P<fence>`{3,}|~{3,})(?P<info>[^\n]*)$"
 )
 _FENCE_CLOSE_RE = re.compile(r"^(?:[ \t]*>)*[ \t]*(?P<fence>`{3,}|~{3,})[ \t\r]*$")
@@ -108,11 +114,12 @@ def fence_for(code: str, char: str = "`") -> str:
 
 # --- HTML -> Markdown -------------------------------------------------------
 
-# Removed with their contents. Form controls are UI chrome; head/title/meta
-# are not visible page text; the rest is code or embedded media.
+# Removed with their contents. Form controls are UI chrome; title/meta/link/
+# base are not visible page text; the rest is code or embedded media.
+# <head> is NOT here: see html_to_markdown.
 _DROP_TAGS = (
     "script", "style", "svg", "noscript", "iframe", "template", "object",
-    "head", "title", "meta", "link",
+    "title", "meta", "link", "base",
     "button", "input", "select", "option", "optgroup", "textarea", "datalist",
 )
 
@@ -211,6 +218,10 @@ def html_to_markdown(html: Optional[str]) -> str:
     for tag in soup.find_all(list(_DROP_TAGS)):
         if not getattr(tag, "decomposed", False):  # already gone with a parent
             tag.decompose()
+    # Head-only elements are gone now. Without a "</head>" html.parser puts
+    # <body> and everything after it inside <head>, so keep what is left.
+    for head in soup.find_all("head"):
+        head.unwrap()
     md = _Converter(**_OPTIONS).convert_soup(soup)
     md = "".join(
         chunk if is_code else _WS_ONLY_LINE_RE.sub("", chunk)
