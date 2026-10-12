@@ -17,6 +17,8 @@ keywords = ["crawler", "scraper", "readme.io", "encompass", "developer-connect"]
 dependencies = [
     "requests>=2.31",
     "rich>=13.0",
+    # HTML -> Markdown for ReadMe `[block:html]` bodies and custom pages
+    "markdownify>=1.1.0",
 ]
 
 [project.optional-dependencies]

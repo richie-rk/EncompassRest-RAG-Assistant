@@ -52,6 +52,9 @@ dependencies = [
     "ollama>=0.5.1",
     "einops>=0.7.0",
     "requests>=2.31.0",
+    # Crawler + index build (scripts/crawler, scripts/create_vector_store.py)
+    "rich>=13.0",
+    "markdownify>=1.1.0",
 ]
 
 [project.optional-dependencies]
@@ -112,3 +115,7 @@ python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

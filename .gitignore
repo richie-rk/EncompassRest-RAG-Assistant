@@ -34,8 +34,6 @@ config/
 config/*
 requirements/
 requirements/*
-tests/
-tests/*
 migrations/
 migrations/*
 
@@ -91,3 +89,7 @@ coverage.xml
 # Documentation
 docs/
 docs/*
+
+# Crawler HTML cache and runtime logs
+scripts/data/cache/
+logs/
