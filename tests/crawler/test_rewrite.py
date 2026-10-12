@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import pytest
@@ -548,3 +551,26 @@ def test_lone_surrogate_in_legacy_block_json_is_replaced() -> None:
     out = rw('[block:callout]{"type": "info", "body": "Great job \\ud83d"}[/block]')
     assert out == "> **Info**\n>\n> Great job \ufffd"
     out.encode("utf-8")
+
+
+@pytest.mark.parametrize("prefix", ["- ", "1. ", "- > ", "> - ", "> 2) "])
+def test_multi_line_reusable_content_in_heading_inside_list_item(prefix: str) -> None:
+    # the heading is joined onto one line, as in a top-level heading: splitting
+    # it out of the list item would leave "- ## " empty
+    out = rw(f"{prefix}## <S /> title", {"S": "Loan API\nv3"})
+    assert out == f"{prefix}## Loan API v3 title"
+
+
+def test_rewrite_does_not_import_the_http_layer() -> None:
+    """rewrite is text-only: importing it must not pull in fetch/requests."""
+    code = (
+        "import sys\n"
+        "import scripts.crawler.rewrite\n"
+        "bad = [m for m in ('requests', 'scripts.crawler.fetch', 'scripts.crawler.sidebar')\n"
+        "       if m in sys.modules]\n"
+        "assert not bad, bad\n"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run([sys.executable, "-c", code], cwd=repo_root,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr

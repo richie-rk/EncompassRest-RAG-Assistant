@@ -16,7 +16,7 @@ from scripts.crawler.extract import (
     find_reusable_content,
 )
 from scripts.crawler.oas import oas_fingerprint
-from scripts.crawler.sidebar import FrontierEntry
+from scripts.crawler.sidebar import Frontier, FrontierEntry
 from tests.crawler.fixtures.fake_site import LOGIN_HTML, ssr_html
 
 BASE = "https://dev.example.com"
@@ -318,3 +318,29 @@ def test_changelog_found_by_reference_gets_its_real_title_in_the_breadcrumb():
     assert r["breadcrumb"] == ["Release Notes", "Release 2"]
     nav = entry("rel-2", "changelog", via="sidebar", breadcrumb=["What's New", "Release 2 (25.1)"])
     assert run({"changelog": REL2}, nav).record["breadcrumb"] == ["What's New", "Release 2 (25.1)"]
+
+
+def test_changelog_navigation_breadcrumb_ending_in_the_slug_is_kept():
+    # a sidebar node titled with its slug: real navigation, not a placeholder
+    nav = entry("rel-2", "changelog", via="sidebar", breadcrumb=["What's New", "rel-2"])
+    assert run({"changelog": REL2}, nav).record["breadcrumb"] == ["What's New", "rel-2"]
+    # placeholders from slug-only sources are still replaced by the real title
+    for via, crumb in (("changelog_ref", ["Release Notes", "rel-2"]), ("link_bfs", []),
+                       ("sitemap", [])):
+        e = entry("rel-2", "changelog", via=via, breadcrumb=crumb)
+        assert run({"changelog": REL2}, e).record["breadcrumb"] == ["Release Notes", "Release 2"]
+    # a sidebar node in a "Release Notes" category titled with its slug: navigation too
+    nav = entry("rel-2", "changelog", via="sidebar", breadcrumb=["Release Notes", "rel-2"])
+    assert run({"changelog": REL2}, nav).record["breadcrumb"] == ["Release Notes", "rel-2"]
+
+
+def test_changelog_placeholder_kept_through_a_sitemap_upgrade_is_still_replaced():
+    # the index's changelog_ref entry is found again by the sitemap, which has
+    # no breadcrumb: the entry becomes "sitemap" but keeps the placeholder
+    frontier = Frontier()
+    frontier.add(entry("rel-2", "changelog", via="changelog_ref",
+                       breadcrumb=["Release Notes", "rel-2"]))
+    frontier.add(entry("rel-2", "changelog", via="sitemap"))
+    e = frontier.get(f"{P}/changelog/rel-2")
+    assert e.discovered_via == "sitemap" and e.breadcrumb == ["Release Notes", "rel-2"]
+    assert run({"changelog": REL2}, e).record["breadcrumb"] == ["Release Notes", "Release 2"]

@@ -749,3 +749,70 @@ def test_lone_surrogate_in_page_json_does_not_abort_the_crawl(tmp_path):
     assert cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, site_resources())) == 0
     recs, *_ = load(tmp_path)
     assert "Great job �" in recs[f"{P}/docs/html-guide"]["body_md"]
+
+
+def test_lone_surrogate_in_ssr_props_json_does_not_abort_the_crawl(tmp_path):
+    """The ssr-props JSON itself carries the lone surrogate escape (not a
+    legacy block inside a body): parse_ssr_props must repair it, or writing
+    the record as UTF-8 aborts the crawl."""
+    pages = site_pages()
+    pages[f"{P}/docs/secret-guide"] = pages[f"{P}/docs/secret-guide"].replace(
+        '"Hidden text."', '"Hidden text \\ud83d"')
+    assert '"Hidden text \\ud83d"' in pages[f"{P}/docs/secret-guide"]
+    assert "[block:" not in pages[f"{P}/docs/secret-guide"]
+    assert cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, site_resources())) == 0
+    recs, *_ = load(tmp_path)
+    assert recs[f"{P}/docs/secret-guide"]["body_md"] == "Hidden text �"
+
+
+def test_section_without_a_changelog_is_not_a_failure(tmp_path):
+    pages = {url: html for url, html in site_pages().items() if "/changelog" not in url}
+    code = cli.main(argv(tmp_path), fetcher=FakeFetcher(pages, site_resources()))
+    assert code == 0
+    recs, _, _, report = load(tmp_path)
+    assert not any("/changelog/" in url for url in recs)
+    assert report["changelog_index"]["absent"] is True
+    assert report["changelog_index"]["incomplete"] is False
+    assert report["changelog_index"]["pages"][0]["note"] == "section has no changelog"
+    assert report["unexpected_failures"] == [] and report["exit_code"] == 0
+    # with a changelog, the flag is off
+    assert cli.main(argv(tmp_path), fetcher=FakeFetcher(site_pages(), site_resources())) == 0
+    assert load(tmp_path)[3]["changelog_index"]["absent"] is False
+
+
+def test_backup_left_by_a_failed_restore_survives_later_runs(tmp_path, monkeypatch, capsys):
+    """Run 1's rollback cannot restore the registry, so its previous version
+    is only in <registry>.bak. Run 2 fails the same way and run 3 succeeds:
+    neither may delete or overwrite that .bak."""
+    before = _seed_existing(tmp_path)
+    o = outputs(tmp_path)
+    real_replace = os.replace
+    broken = {"on": True}
+
+    def replace(src, dst):
+        if broken["on"]:
+            if Path(dst) == o["out"] and str(src).endswith(".partial"):
+                raise PermissionError("records file in use")
+            if Path(src) == o["oas"] and str(dst).endswith(".partial"):
+                raise PermissionError("registry file in use")  # rollback fails too
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(cli.os, "replace", replace)
+    monkeypatch.setattr(cli.console, "width", 1000)  # keep paths on one line
+    kept = o["oas"].with_name(o["oas"].name + ".bak")
+    for run in (1, 2):
+        with pytest.raises(PermissionError):
+            cli.main(argv(tmp_path), fetcher=FakeFetcher(site_pages(), site_resources()))
+        assert kept.read_text(encoding="utf-8") == before[o["oas"]]
+        out = capsys.readouterr().out
+        assert "could not be restored" in out
+        # the message names the backup this run made, not a glob
+        made = kept if run == 1 else o["oas"].with_name(o["oas"].name + ".1.bak")
+        assert f"{o['oas']}  (previous version: {made})" in out
+
+    broken["on"] = False
+    assert cli.main(argv(tmp_path), fetcher=FakeFetcher(site_pages(), site_resources())) == 0
+    assert kept.read_text(encoding="utf-8") == before[o["oas"]]
+    # only backups from failed restores remain; this run's own were cleaned up
+    assert sorted(p.name for p in (tmp_path / "data").glob("*.bak")) == [
+        "developer_connect_oas.json.1.bak", "developer_connect_oas.json.bak"]

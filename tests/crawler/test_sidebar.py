@@ -14,6 +14,7 @@ from scripts.crawler.sidebar import (
     enumerate_section,
     enumerate_sitemap,
     enumerate_welcome,
+    load_json,
     parse_sitemap,
     parse_ssr_props,
     walk_sidebars,
@@ -338,7 +339,7 @@ def test_changelog_reference_to_hidden_entry_is_dropped_with_skip_hidden():
 @pytest.mark.parametrize("pages,unexpected", [
     ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 503}, True),
     ({f"{P}/changelog": 503}, True),
-    ({}, True),  # the index itself is gone (404 on page 1)
+    ({}, False),  # 404 on page 1: the section has no changelog
     ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 429}, True),
     ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 404}, False),  # end of the list
     ({f"{P}/changelog": _cl("r2"), f"{P}/changelog?page=2": 410}, False),
@@ -347,6 +348,22 @@ def test_changelog_index_failure_is_flagged_not_mistaken_for_the_end(pages, unex
     idx = enumerate_changelog(FakeFetcher(pages), base_url=BASE, section=SEC)
     assert idx.incomplete is unexpected
     assert bool(idx.pages[-1].get("unexpected")) is unexpected
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_changelog_index_missing_on_page_one_means_the_section_has_no_changelog(status):
+    idx = enumerate_changelog(FakeFetcher({f"{P}/changelog": status}), base_url=BASE,
+                              section=SEC)
+    assert idx.absent is True and idx.incomplete is False
+    assert idx.entries == [] and len(idx.pages) == 1
+    assert not idx.pages[0].get("unexpected")
+    assert idx.pages[0]["note"] == "section has no changelog"
+    # a server or network failure on page 1 is still a lost index, not "no changelog"
+    for failing in (503, 429):
+        idx = enumerate_changelog(FakeFetcher({f"{P}/changelog": failing}), base_url=BASE,
+                                  section=SEC)
+        assert idx.absent is False and idx.incomplete is True
+        assert idx.pages[0]["unexpected"] is True
 
 
 def test_changelog_offline_cache_miss_past_page_one_ends_the_list():
@@ -392,3 +409,18 @@ def test_parse_ssr_props_replaces_lone_surrogates():
     assert data["doc"]["ok"] == "\U0001F600"  # a valid pair is untouched
     assert data["doc"]["�k"] == 1
     json.dumps(data, ensure_ascii=False).encode("utf-8")  # writable as UTF-8
+
+
+@pytest.mark.parametrize("text,expected", [
+    # JSON "\\uD83D\uDE00": an escaped backslash and the letters "uD83D" (no
+    # escape at all), then a low surrogate escape with no high half before it
+    ('{"s": "\\\\uD83D\\uDE00"}', "\\uD83D\ufffd"),
+    ('{"s": "\\\\\\\\\\uDE00"}', "\\\\\ufffd"),  # two escaped backslashes, lone low
+    ('{"s": "\\\\\\ud83d\\ude00"}', "\\\U0001F600"),  # backslash, then a valid pair
+    ('{"s": "C:\\\\ud83d"}', "C:\\ud83d"),  # literal text, nothing to repair
+])
+def test_surrogate_escapes_after_escaped_backslashes(text, expected):
+    for data in (load_json(text),
+                 parse_ssr_props(f'<script id="ssr-props">{text}</script>')):
+        assert data == {"s": expected}
+        json.dumps(data, ensure_ascii=False).encode("utf-8")  # writable as UTF-8

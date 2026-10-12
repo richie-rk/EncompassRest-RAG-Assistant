@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 from .htmlmd import collapse_blank_lines, fence_for, html_to_markdown, split_fenced_code
-from .sidebar import load_json
+from .jsonutil import load_json  # not .sidebar: that pulls in fetch.py and requests
 
 __all__ = [
     "MAX_REUSABLE_DEPTH",
@@ -101,11 +101,13 @@ LEGACY_BLOCK_RE = re.compile(
 )
 # Container prefix of a line: indentation and any mix of blockquote markers
 # and list markers ("> ", "1. ", "- > ", "- - ", "> - ").
-_CONTAINER_PREFIX_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])[ \t]))*[ \t]*$")
+_CONTAINER_MARKERS = r"(?:[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])[ \t]))*"
+_CONTAINER_PREFIX_RE = re.compile(r"^" + _CONTAINER_MARKERS + r"[ \t]*$")
 _LIST_MARKER_RE = re.compile(r"(?:[-*+]|\d{1,9}[.)])(?=[ \t])")
 _QUOTE_MARKERS_RE = re.compile(r"^[ \t]*(?:>[ \t]?)+", re.M)
 _TABLE_EDGE_RE = re.compile(r"^(?:[ \t]*>)*[ \t]*\|")
-_ATX_HEADING_RE = re.compile(r"^(?:[ \t]*>)*[ \t]{0,3}#{1,6}[ \t]")
+# An ATX heading, also inside list items and blockquotes ("- ## ", "1. > # ").
+_ATX_HEADING_RE = re.compile(r"^" + _CONTAINER_MARKERS + r"[ \t]{0,3}#{1,6}[ \t]")
 
 _BACKTICKS_RE = re.compile(r"`+")
 _BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")

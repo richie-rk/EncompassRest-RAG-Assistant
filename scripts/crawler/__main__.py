@@ -16,7 +16,8 @@ Outputs (default: next to --out):
 
 Never clobbers good data: every output is staged as ``<file>.partial`` and moved
 into place with ``os.replace`` only after the crawl completes (previous files
-are backed up while that happens and restored if a move fails). On an
+are backed up while that happens and restored if a move fails; a ``*.bak``
+left by a restore that failed is never deleted, see ``StagedOutputs``). On an
 exception or Ctrl-C the previous files stay untouched and the partial files
 are kept for inspection. A run that would replace a published dataset with
 no records, or that had unexpected failures and lost more than
@@ -247,7 +248,15 @@ def is_unexpected(error_class: str, via: str) -> bool:
 
 
 class StagedOutputs:
-    """Write every output to ``<target>.partial`` and publish them together."""
+    """Write every output to ``<target>.partial`` and publish them together.
+
+    While publishing, each existing target is backed up to ``<target>.bak``
+    and the backup is deleted once every target is in place. An existing
+    ``.bak`` is never deleted or overwritten: a publish whose rollback failed
+    leaves the only copy of the previous output there, so a later run backs
+    up to the next free name (``<target>.1.bak``, ``<target>.2.bak``, ...)
+    instead. Delete leftover ``*.bak`` files by hand once they are not needed.
+    """
 
     #: Publish order. Registry first: records reference it by oas_id.
     ORDER = ("oas", "records", "manifest", "report")
@@ -255,8 +264,9 @@ class StagedOutputs:
     def __init__(self, *, records: Path, manifest: Path, oas: Path, report: Path):
         self.targets = {"records": records, "manifest": manifest, "oas": oas, "report": report}
         self.partials = {k: v.with_name(v.name + ".partial") for k, v in self.targets.items()}
-        #: Targets left torn by a failed publish that could not be rolled back.
-        self.not_restored: List[Path] = []
+        #: Targets left torn by a failed publish that could not be rolled back,
+        #: each with the backup holding its previous version (None: there was none).
+        self.not_restored: Dict[Path, Optional[Path]] = {}
         for path in self.targets.values():
             path.parent.mkdir(parents=True, exist_ok=True)
         self.records_f: IO[str] = self.partials["records"].open("w", encoding="utf-8")
@@ -299,7 +309,10 @@ class StagedOutputs:
         if not target.exists():
             return None
         backup = target.with_name(target.name + ".bak")
-        backup.unlink(missing_ok=True)
+        n = 0
+        while os.path.lexists(backup):  # never reuse one: see the class docstring
+            n += 1
+            backup = target.with_name(f"{target.name}.{n}.bak")
         try:
             os.link(target, backup)  # cheap, and the target is never missing
         except OSError:
@@ -335,7 +348,7 @@ class StagedOutputs:
                 if backup is not None:
                     os.replace(backup, target)
             except OSError:
-                self.not_restored.append(target)
+                self.not_restored[target] = backup
 
 
 # --- the crawl ------------------------------------------------------------------
@@ -682,7 +695,8 @@ class Crawl:
             "skipped_hidden": self.skipped_hidden,
             "changelog_index": {"pages": changelog.pages, "entries": len(changelog.by_slug),
                                 "skipped_hidden": changelog.skipped_hidden,
-                                "incomplete": changelog.incomplete},
+                                "incomplete": changelog.incomplete,
+                                "absent": changelog.absent},
             "sitemap": ({"documents": sitemap.documents, "page_urls": len(sitemap.entries),
                          "ignored_urls": sitemap.ignored_urls,
                          "incomplete": sitemap.incomplete}
@@ -742,6 +756,8 @@ def _print_summary(report: Dict) -> None:
         console.print(f"  [bold red]max-pages cap {cap['max_pages']['cap']} dropped "
                       f"{cap['max_pages']['not_enqueued']} URLs: "
                       f"{cap['max_pages']['by_source']}[/bold red]")
+    if report["changelog_index"]["absent"]:
+        console.print("  changelog index : none (the section has no changelog)")
     if report["changelog_index"]["incomplete"]:
         page = [p for p in report["changelog_index"]["pages"] if p.get("unexpected")][-1]
         detail = page.get("error") or f"HTTP {page.get('http_status')}"
@@ -759,12 +775,13 @@ def _print_summary(report: Dict) -> None:
 
 
 def _print_partials(paths: List[Path], staged: Optional[StagedOutputs] = None) -> None:
-    torn = staged.not_restored if staged is not None else []
+    torn = staged.not_restored if staged is not None else {}
     if torn:
-        console.print("[bold red]Publishing failed and these outputs could not be restored "
-                      "(their previous version is next to them as *.bak):[/bold red]")
-        for p in torn:
-            console.print(f"  {escape(str(p))}")
+        console.print("[bold red]Publishing failed and these outputs could not be "
+                      "restored:[/bold red]")
+        for target, backup in torn.items():
+            was = f"previous version: {backup}" if backup else "there was no previous version"
+            console.print(f"  {escape(str(target))}  ({escape(was)})")
     else:
         console.print("[yellow]Previous output files were left untouched.[/yellow]")
     console.print("[yellow]Partial results:[/yellow]")

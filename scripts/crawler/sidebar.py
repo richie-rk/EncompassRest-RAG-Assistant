@@ -38,10 +38,11 @@ import re
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import quote, urljoin, urlparse
 
 from .fetch import OFFLINE_CACHE_MISS, Fetcher
+from .jsonutil import load_json  # also re-exported: sidebar.load_json
 
 SSR_PROPS_RE = re.compile(
     r'<script\b[^>]*\bid=["\']ssr-props["\'][^>]*>(.*?)</script>',
@@ -49,15 +50,6 @@ SSR_PROPS_RE = re.compile(
 )
 CHANGELOG_REF_RE = re.compile(r'\(changelog:([a-z0-9][a-z0-9._-]*)\)', re.IGNORECASE)
 SLUG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
-# A JSON escape such as "\ud83d" (an emoji cut in half) decodes to a lone
-# surrogate, which cannot be written as UTF-8 and used to abort the crawl.
-# A high surrogate escape not followed by a low one, or a low one without a
-# high one before it (valid pairs decode to one character and are fine).
-_LONE_SURROGATE_ESCAPE_RE = re.compile(
-    r'\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})'
-    r'|(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}'
-)
-_LONE_SURROGATE_RE = re.compile('[\ud800-\udfff]')
 
 #: Every ``discovered_via`` value, most authoritative first.
 DISCOVERY_SOURCES: Tuple[str, ...] = (
@@ -101,31 +93,6 @@ class FrontierEntry:
 
 
 # --- helpers ------------------------------------------------------------------
-
-
-def _scrub_surrogates(value: Any) -> Any:
-    """``value`` with every lone UTF-16 surrogate replaced by U+FFFD.
-
-    After ``json.loads`` valid pairs are already combined into one character,
-    so any code point left in the surrogate range is a lone half.
-    """
-    if isinstance(value, str):
-        return _LONE_SURROGATE_RE.sub("\ufffd", value)
-    if isinstance(value, list):
-        return [_scrub_surrogates(v) for v in value]
-    if isinstance(value, dict):
-        return {_scrub_surrogates(k): _scrub_surrogates(v) for k, v in value.items()}
-    return value
-
-
-def load_json(text: str) -> Any:
-    """``json.loads`` whose strings are always writable as UTF-8: a lone
-    surrogate escape (``"\\ud83d"`` without its pair) becomes U+FFFD.
-    Used for ssr-props and for the JSON inside legacy ``[block:*]`` bodies."""
-    data = json.loads(text)
-    if _LONE_SURROGATE_ESCAPE_RE.search(text):
-        data = _scrub_surrogates(data)
-    return data
 
 
 def parse_ssr_props(html: str) -> Optional[Dict]:
@@ -441,6 +408,8 @@ class ChangelogIndex:
     skipped_hidden: int = 0
     #: Pagination stopped on a failed fetch, not on the end of the list.
     incomplete: bool = False
+    #: ``/changelog`` itself is a 404/410: the section has no changelog.
+    absent: bool = False
     #: slug -> ``changelog_ref`` entry for slugs referenced in bodies but not
     #: (yet) listed by the index; replaced if a later index page lists them.
     ref_entries: Dict[str, FrontierEntry] = field(default_factory=dict)
@@ -523,11 +492,13 @@ def enumerate_changelog(
     is not a 200, has no ssr-props, or ``max_pages`` is reached (flagged as
     ``truncated`` when the last page still produced new slugs).
 
-    Only a 404/410 (or, offline, a cache miss: 404s are never cached) past
-    page 1 is the normal end of the list. Any other failed fetch - a 5xx or
-    429 after retries, a network error, page 1 missing - loses every entry
-    after it, so the page is marked ``unexpected`` and the index
-    ``incomplete``; the crawler turns that into an unexpected failure.
+    A 404/410 (or, offline, a cache miss: 404s are never cached) past page 1
+    is the normal end of the list, and a 404/410 on page 1 means the section
+    has no changelog at all (``absent``; not a failure). Any other failed
+    fetch - a 5xx or 429 after retries, a network error, an offline cache
+    miss of page 1 - loses every entry after it, so the page is marked
+    ``unexpected`` and the index ``incomplete``; the crawler turns that into
+    an unexpected failure.
     """
     base_url = base_url.rstrip("/")
     index_url = f"{base_url}/{section}/changelog"
@@ -542,7 +513,10 @@ def enumerate_changelog(
         out.pages.append(page_info)
         if res is None or status != 200:
             offline_miss = getattr(res, "error", None) == OFFLINE_CACHE_MISS
-            if not (n > 1 and (status in (404, 410) or offline_miss)):
+            if n == 1 and status in (404, 410):
+                out.absent = True
+                page_info["note"] = "section has no changelog"
+            elif not (n > 1 and (status in (404, 410) or offline_miss)):
                 page_info["unexpected"] = True
                 out.incomplete = True
             break

@@ -48,6 +48,13 @@ ERR_NO_SSR_PROPS = "no_ssr_props"
 ERR_NO_DOC = "no_doc_or_custompage"
 ERR_CHANGELOG_MISMATCH = "changelog_slug_mismatch"
 
+#: Discovery sources whose breadcrumb is the site's sidebar navigation. Any
+#: other source's ``["Release Notes", "<slug>"]`` is a placeholder: either it
+#: only knew the slug (changelog_ref, link_bfs), or it carries none and kept
+#: one from an earlier source when it upgraded the entry (sitemap after a
+#: changelog_ref, see ``Frontier._maybe_upgrade``).
+_SIDEBAR_SOURCES = frozenset({"sidebar", "reference_sidebar"})
+
 
 @dataclass
 class PageExtraction:
@@ -434,10 +441,12 @@ def _changelog_record(entry: FrontierEntry, match: Dict, ssr: Dict, source: str,
                         exclude=(match,), base_url=base_url, section=section)
     title = match.get("title") or entry.title
     # Entries found through a reference or a link only know their slug; their
-    # placeholder breadcrumb (["Release Notes", "<slug>"]) would end up in
-    # every chunk header. Navigation breadcrumbs are kept.
+    # placeholder breadcrumb (["Release Notes", "<slug>"], or none) would end
+    # up in every chunk header. Navigation breadcrumbs are kept, even one
+    # whose last item is the slug (a sidebar node titled with its slug).
     breadcrumb = list(entry.breadcrumb)
-    if not breadcrumb or breadcrumb[-1] == entry.slug:
+    if not breadcrumb or (entry.discovered_via not in _SIDEBAR_SOURCES
+                          and breadcrumb == ["Release Notes", entry.slug]):
         breadcrumb = ["Release Notes", title]
     record = {
         "source": "developer_connect",

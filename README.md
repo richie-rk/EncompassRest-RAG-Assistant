@@ -177,17 +177,37 @@ If you just want to run the API, you can skip this. When `./vector_store/` is mi
 To build it yourself, first crawl the docs:
 
 ```bash
-# Fetches the guide, API-reference, and changelog pages for /developer-connect/
-# and writes scripts/data/developer_connect.jsonl
+# Crawls the guide, API-reference, changelog, and custom pages under /developer-connect/
+# and writes its outputs to scripts/data/
 python -m scripts.crawler
 ```
 
-The crawler reads the page frontier from the ReadMe sidebar and pulls each page's Markdown, OpenAPI spec, and metadata from the embedded `ssr-props` JSON. The first run takes about 5 to 7 minutes (216 pages at a 0.5s delay), and HTML is cached to `scripts/data/cache/` so re-runs are fast. Run `python -m scripts.crawler --help` for the full set of flags (`--dry-run`, `--limit`, `--no-cache`, and so on).
+The welcome page's sidebar only lists a fraction of the site, so the crawler builds its page list from several sources and records which one found each page (`discovered_via`):
 
-Then create the vector store:
+- the docs and API-reference sidebars embedded in every fetched page's `ssr-props` JSON
+- `/sitemap.xml` and `/developer-connect/sitemap.xml`
+- the paginated changelog index (`/developer-connect/changelog`, `?page=2`, ...) and `changelog:` references in page bodies
+- the operationIds in each OpenAPI document, which ReadMe usually uses as page slugs
+- links in page bodies and in the rendered HTML
+
+Each page is fetched once, and its Markdown, OpenAPI spec, and metadata come from the embedded `ssr-props` JSON. Hidden pages are included by default and flagged with `hidden: true`; pass `--skip-hidden` to leave them out. HTML is cached to `scripts/data/cache/`, so re-runs only fetch what isn't cached yet, and `--offline` re-extracts everything from that cache without touching the network.
+
+The crawl writes four files to `scripts/data/`:
+
+- `developer_connect.jsonl`, one record per page
+- `developer_connect_oas.json`, a registry of OpenAPI documents keyed by `oas_id`, each stored once (records point at it instead of embedding the spec)
+- `developer_connect_manifest.jsonl`, one row per fetch, with its HTTP status, cache hit, error class, and where the URL was found
+- `developer_connect_report.json`, a completeness report
+
+Check the report after a crawl. `unexpected_failures` should be empty (if it isn't, the crawler exits with code 1), `navigation_gaps` lists pages from the sidebars, sitemaps, or changelog index that produced no record, and `reusable_content_unresolved` lists pages whose ReadMe reusable-content snippets couldn't be resolved (missing, or nested too deep).
+
+Your previous outputs are only replaced once a crawl has finished. Everything is written to `*.partial` files first and moved into place together at the end, so an interrupted or crashed run leaves the old files untouched. A run that produced no records, or that had unexpected failures and fewer than 90% of the records already published, doesn't replace them either (`--force-publish` overrides that). For a quick test, `--limit 10` crawls just the first 10 pages with discovery off and writes `*.sample.*` files (`developer_connect.sample.jsonl` and so on) instead. Run `python -m scripts.crawler --help` for the full set of flags (`--dry-run`, `--no-cache`, `--max-pages`, and so on).
+
+Then create the vector store. It reads `developer_connect.jsonl`, the OAS registry next to it, and the Postman collection in `scripts/data/`, and writes `./vector_store/`:
 
 ```bash
-python scripts/create_vector_store.py
+python -m scripts.create_vector_store            # chunk, embed, and build the indices
+python -m scripts.create_vector_store --dry-run  # check chunking and stats without embeddings
 ```
 
 ## Usage
