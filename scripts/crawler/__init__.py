@@ -1,7 +1,10 @@
-"""Sidebar-driven crawler for ICE MT Developer Connect (ReadMe-hosted) docs.
+"""Crawler for ICE MT Developer Connect (ReadMe-hosted) docs.
 
-Pipeline: enumerate frontier from ssr-props sidebar -> fetch each page once ->
-extract normalized record from ssr-props -> emit JSONL.
+Pipeline: seed the frontier (welcome sidebars, paginated changelog index,
+sitemaps) -> fetch each page once (cached) -> parse its ssr-props once ->
+emit a normalized record, store its OpenAPI document once in a registry, and
+enqueue everything the page reveals (sidebars, links, OAS operationIds) ->
+write records, manifest, OAS registry and a completeness report atomically.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

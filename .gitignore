@@ -93,3 +93,7 @@ docs/*
 # Crawler HTML cache and runtime logs
 scripts/data/cache/
 logs/
+
+# Crawler by-products: in-progress outputs and --limit sample runs
+scripts/data/*.partial
+scripts/data/*.sample.*

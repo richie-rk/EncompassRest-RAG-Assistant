@@ -19,6 +19,8 @@ dependencies = [
     "rich>=13.0",
     # HTML -> Markdown for ReadMe `[block:html]` bodies and custom pages
     "markdownify>=1.1.0",
+    # htmlmd.py parses with BeautifulSoup directly (markdownify also needs it)
+    "beautifulsoup4>=4.9",
 ]
 
 [project.optional-dependencies]
